@@ -1,3 +1,13 @@
+# VIctory on an RTX 3080 (NVIDIA)
+
+**Current state (26 Nov 2026, play13):** 13 fps on average in the open world, up from 3-4 fps, on an RTX 3080 10 GB, 32 GB RAM and i9-12900F at 1080p. That is 10.9-11.6 ms per 1,000 draws, down from 36-42. Playable, not smooth yet; the goal is a stable 30 fps.
+
+- **What this is:** the open-source VIctory layer (GPL-3.0), on the cool_fox fork, with about 200 commits on top: ported fixes from about a dozen public forks plus our own NVIDIA memory and residency work and measurement tooling.
+- **The approach, the numbers and what limits it now:** [WRITEUP.md](WRITEUP.md).
+- **Run it:** `cargo build --release -p victory --features diagnostics`, set `VICTORY_GAME_DIR` to your own copy of the title (no game files are included), then run `scripts\play-nvidia.ps1`.
+
+---
+
 # VIctory on an RX 7900 XTX
 
 ## Run the codec_d Windows build
