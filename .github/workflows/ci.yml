@@ -39,7 +39,9 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # Includes xtask's repository_passes_policy, the asset-policy check.
-      - run: cargo test --workspace --locked
+      # victory-gpu's tests need a real D3D12 card (SM 6.6); GitHub's runners have none.
+      # Run them on a PC with an NVIDIA or AMD card: cargo test --release -p victory-gpu -- --test-threads=1
+      - run: cargo test --workspace --exclude victory-gpu --locked
 
   test-diagnostics:
     name: Diagnostics tests
@@ -49,7 +51,7 @@ jobs:
       - uses: actions/checkout@v5
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features --locked -- --test-threads=1
+      - run: cargo test --workspace --exclude victory-gpu --all-features --locked -- --test-threads=1
 
   check:
     needs: [clippy, test-default, test-diagnostics]
