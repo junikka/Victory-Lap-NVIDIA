@@ -278,7 +278,7 @@ pub(crate) const HIT_FOLD: [(u32, u32); 2] = [(15, 0x2C1B_3C6D), (12, 0x297A_2D3
 /// registers' bits. `share` is the fraction of the 16-bit range that hits;
 /// 0 hits nothing and 1 hits every ray.
 pub fn stand_in_hits(direction: [u32; 3], share: f32) -> bool {
-    if !(share > 0.0) {
+    if share.is_nan() || share <= 0.0 {
         return false;
     }
     let mut h = direction[0].wrapping_mul(HIT_MIX[0]);
@@ -304,8 +304,8 @@ pub fn stand_in_hit(pointer: u32, extent: f32, is_box: bool) -> [u32; 4] {
     }
 }
 
-/// Tests force the switches for the thread that is lowering. The running
-/// title never sets them; the process reads the environment once.
+// Tests force the switches for the thread that is lowering. The running
+// title never sets them; the process reads the environment once.
 #[cfg(test)]
 thread_local! {
     static FORCE_MISS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
