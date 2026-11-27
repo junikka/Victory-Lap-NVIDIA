@@ -7,6 +7,7 @@ use std::ffi::{CStr, c_void};
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::cycle;
 use super::record::{kernel, on, standing, stood_at, ticks, waited, woken};
 
 type Handle = *mut c_void;
@@ -34,7 +35,7 @@ macro_rules! wrapped {
                     // (or the module the title imports it from).
                     let real: unsafe extern "system" fn($($type),*) $(-> $result)? =
                         unsafe { std::mem::transmute(TABLE[$index].1.load(Ordering::Relaxed)) };
-                    if !on() {
+                    if !on() && !cycle::on() {
                         // SAFETY: the caller's own call.
                         return unsafe { real($($arg),*) };
                     }
@@ -52,14 +53,21 @@ macro_rules! wrapped {
 fn wait<T>(name: &'static str, object: u64, call: impl FnOnce() -> T) -> T {
     use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
     let t0 = ticks();
-    let result = {
+    let result = if on() {
         let _standing = standing(object);
+        call()
+    } else {
         call()
     };
     // SAFETY: plain queries of this thread's own.
     unsafe {
         let error = GetLastError();
-        waited(name, object, t0);
+        if on() {
+            waited(name, object, t0);
+        }
+        if cycle::on() {
+            cycle::waited(name, t0);
+        }
         SetLastError(error);
     }
     result
@@ -73,7 +81,13 @@ fn measured<T>(name: &'static str, bytes: usize, call: impl FnOnce() -> T) -> T 
     // SAFETY: plain queries of this thread's own.
     unsafe {
         let error = GetLastError();
-        kernel(name, bytes as u64, t0);
+        if on() {
+            kernel(name, bytes as u64, t0);
+        }
+        if cycle::on() {
+            // Work of the kernel's, not a wait: kept as a span.
+            cycle::did(name, t0);
+        }
         SetLastError(error);
     }
     result
@@ -99,7 +113,7 @@ fn lock_of(name: &'static str, lock: Handle, take: &str, call: impl FnOnce()) {
 }
 
 fn released(name: &'static str, object: Handle) {
-    if stood_at(object as u64) {
+    if on() && stood_at(object as u64) {
         woken(name, object as u64);
     }
 }
@@ -219,7 +233,7 @@ const ONLY_REAL: usize = 29;
 /// at the wrappers: once, if a timeline is wanted.
 fn arm() -> bool {
     static ONCE: Once = Once::new();
-    if !super::record::wanted() {
+    if !super::record::wanted() && !cycle::wanted() {
         return false;
     }
     ONCE.call_once(wrap_own);
@@ -231,7 +245,7 @@ pub(super) fn wrap_own() {
     find_real();
     // SAFETY: our own module's mapped image.
     let changed = unsafe { wrap_imports() };
-    tracing::info!(changed, "the timeline's wrappers are in (VICTORY_TIMELINE)");
+    tracing::info!(changed, "the timeline's wrappers are in (VICTORY_TIMELINE, VICTORY_FRAME_TIMELINE)");
 }
 
 fn find_real() {

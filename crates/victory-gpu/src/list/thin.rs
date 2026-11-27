@@ -577,8 +577,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    // (Read here, on the title's thread, while the groups are there:
+    // `VICTORY_GROUP_WAITS`; the count carries whether the wait is left out.)
+    front(this).put(BARRIER_GROUPS, &[u64::from(super::groups::kept(count, groups))]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };

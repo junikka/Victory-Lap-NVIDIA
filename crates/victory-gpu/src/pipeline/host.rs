@@ -713,7 +713,8 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    let lanes = stages.first().and_then(|(s, _)| s.translated()).and_then(|t| wave_lanes(&t.host.dxil));
+                    tracing::warn!(error = %e, ?shaders, wave_lanes = ?lanes, "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -1225,6 +1226,25 @@ impl GraphicsState {
         g.targets.RTFormats[0] = DXGI_FORMAT(format);
         g
     }
+}
+
+/// The wave lanes (minimum, maximum) a compute DXIL container asks of the
+/// host in its pipeline state validation part (`PSV0`: after the 16 bytes of
+/// the stage's own information), when it asks for any: a host whose waves
+/// are narrower refuses the pipeline.
+fn wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
+    let word = |at: usize| dxil.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let parts = word(28)? as usize;
+    for i in 0..parts {
+        let at = word(32 + 4 * i)? as usize;
+        if dxil.get(at..at + 4)? == b"PSV0" {
+            // part: tag, size; data: the size of the runtime info, then it
+            let info = at + 12;
+            let (min, max) = (word(info + 16)?, word(info + 20)?);
+            return (min != 0 || max != 0).then_some((min, max));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

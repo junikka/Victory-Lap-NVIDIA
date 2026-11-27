@@ -18,12 +18,12 @@ pub(super) struct Threads {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+    pub(super) fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
 }
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
-    fn NtQueryInformationThread(
+    pub(super) fn NtQueryInformationThread(
         thread: *mut std::ffi::c_void,
         class: i32,
         out: *mut std::ffi::c_void,
@@ -181,7 +181,7 @@ impl Names {
 
     /// A name for `address`: our own functions by their names, others by
     /// their module and place in it.
-    fn of(&mut self, address: usize) -> String {
+    pub(super) fn of(&mut self, address: usize) -> String {
         if let Some(name) = self.known.get(&address) {
             return name.clone();
         }

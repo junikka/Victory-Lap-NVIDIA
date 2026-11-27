@@ -12,6 +12,7 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+mod ranges;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -419,6 +420,7 @@ pub(crate) fn sync_heaps() {
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
+        let mut taken_in_check: Vec<(u32, u32)> = Vec::new();
         // Ranges of the heap to look at, and whether a range is one the
         // fallback of renderer port #2 looks at whole.
         let mut parts: Vec<(usize, usize, bool)> = Vec::new();
@@ -428,10 +430,7 @@ pub(crate) fn sync_heaps() {
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
-            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
-                let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
-            }
+            let runs = crate::port_descriptors::take(start).unwrap_or_default();
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
@@ -441,9 +440,8 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-            }
+            let pages = crate::port_descriptors::to_check(frame);
+            (parts, taken_in_check) = crate::port_descriptors::plan_parts(start, end, step, mirrored_count, &runs, &pages, crate::watch::PAGE);
         } else {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
@@ -541,7 +539,7 @@ pub(crate) fn sync_heaps() {
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes)
                     };
-                    if check {
+                    if check && !crate::port_descriptors::was_taken_in_check(&taken_in_check, index) {
                         // Renderer port #2's fallback: what no mark told of.
                         crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG, host.copied_tabled(index, frame));
                     }
@@ -751,6 +749,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -947,6 +946,31 @@ pub(crate) struct RtvRecord {
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
+/// Value snapshot for replaying a command list after a cut. Keep the
+/// resource identity as an integer (like draw::State), never the address
+/// of mutable descriptor storage. The caller still owns the resource
+/// lifetime, as with the original recorded command.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct RtvSnapshot {
+    tag: u32,
+    described: u32,
+    resource: usize,
+    desc: [u32; 6],
+}
+
+#[cfg(windows)]
+impl RtvSnapshot {
+    pub(crate) fn restore(self) -> RtvRecord {
+        RtvRecord {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as This,
+            desc: self.desc,
+        }
+    }
+}
+
 impl RtvRecord {
     /// All the view it records is made from: records with equal keys have
     /// equal views (of the same host texture).
@@ -955,6 +979,16 @@ impl RtvRecord {
         let mut words = [self.described; 7];
         words[1..].copy_from_slice(&self.desc);
         (self.resource as usize, words)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn snapshot(self) -> RtvSnapshot {
+        RtvSnapshot {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as usize,
+            desc: self.desc,
+        }
     }
 
     /// The view description in the host's type (the same layout).
@@ -2058,6 +2092,27 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn render_target_snapshot_preserves_original_descriptor_words() {
+        let mut record = super::RtvRecord {
+            tag: super::RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as crate::object::This,
+            desc: [24, 4, 0, 0, 0, 0],
+        };
+        let snapshot = record.snapshot();
+        record.desc[0] = 26;
+        record.resource = 0x2000usize as crate::object::This;
+        let restored = snapshot.restore();
+        assert_eq!(restored.tag, record.tag);
+        assert_eq!(restored.described, record.described);
+        assert_eq!(restored.desc[0], 24);
+        assert_eq!(restored.resource as usize, 0x1000);
+        assert_eq!(record.desc[0], 26);
+        assert_eq!(record.resource as usize, 0x2000);
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 

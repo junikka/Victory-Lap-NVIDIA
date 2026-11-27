@@ -941,6 +941,8 @@ extern "system" fn present(
     let _ = this;
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::timeline::present_begins();
     let called = crate::timeline::span("the title's Present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -1095,6 +1097,7 @@ extern "system" fn present(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
     crate::timeline::presented();
+    crate::timeline::frame_presented();
     crate::faultbook::frame();
     crate::ab::presented(|switch, was, will| {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {

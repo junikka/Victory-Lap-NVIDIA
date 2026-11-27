@@ -250,23 +250,42 @@ pub fn run(
     // clock ticks at that interval (victory-gpu), and the title is given
     // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
     // overrides it; `off` leaves the title alone).
+    // The fixed game step (VICTORY_FIXED_STEP=1, test runs; off without it):
+    // the shortest step is the frame_rate site, so the frame rate below
+    // leaves that one site to it.
+    #[cfg(windows)]
+    let fixed_step = execute && victory_loader::fixed_step::asked();
     #[cfg(windows)]
     if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
-        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+        use victory_loader::frame_rate::{Kind, Patched, SITES, Site, apply, title_interval_us, title_rate};
         let asked = std::env::var("VICTORY_TITLE_FPS").ok();
         match title_rate(ms, asked.as_deref()) {
             Some(rate) => {
                 let size = image.info().size_of_image as usize;
+                let sites: Vec<Site> = SITES.iter().copied().filter(|s| !(fixed_step && s.kind == Kind::SimRate)).collect();
                 // SAFETY: the image stays mapped and nothing of it has run yet.
-                let done = unsafe { apply(image.base(), size, rate, &SITES) };
+                let done = unsafe { apply(image.base(), size, rate, &sites) };
                 let patched = done.iter().filter(|d| **d == Patched::Done).count();
                 println!(
                     "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
-                    SITES.len(),
+                    sites.len(),
                     title_interval_us(rate, false)
                 );
             }
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
+        }
+    }
+    #[cfg(windows)]
+    if fixed_step {
+        use victory_loader::{fixed_step, frame_rate::Patched};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        let done = unsafe { fixed_step::apply(image.base(), size) };
+        if done == Patched::Done {
+            println!("fixed step: every frame steps the title's simulation {:.3} ms (VICTORY_FIXED_STEP)", fixed_step::step_ms());
+            fixed_step::log_every_10s(image.base(), size, victory_hle::frames_begun);
+        } else {
+            println!("fixed step: not applied ({done:?}); the title steps by real time");
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,

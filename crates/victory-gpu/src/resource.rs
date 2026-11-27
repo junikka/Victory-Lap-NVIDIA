@@ -1269,6 +1269,11 @@ struct Hosted {
     no_room: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
+    /// When its host copy was last let go (`crate::host::coarse_ms`, never
+    /// 0; 0: not since it was last made), and its back-off under pressure
+    /// (`crate::residency::backed_off`, ms; 0: none).
+    let_go_at: std::sync::atomic::AtomicU64,
+    keep_ms: std::sync::atomic::AtomicU32,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
     /// The lowest level a view asked for since it had no host copy
@@ -2168,6 +2173,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
+        let let_go_at = r.host.let_go_at.swap(0, Relaxed);
+        if let_go_at != 0 {
+            let since = crate::host::coarse_ms().saturating_sub(let_go_at);
+            if crate::residency::made_again_soon(since) {
+                AGAIN_SOON[0].fetch_add(1, Relaxed);
+                AGAIN_SOON[1].fetch_add(host.bytes, Relaxed);
+            }
+            r.host.keep_ms.store(crate::residency::backed_off(r.host.keep_ms.load(Relaxed), since), Relaxed);
+        }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
@@ -2239,7 +2253,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            let kept = crate::shadow::card_room_kept() + targets_room_kept();
+            let kept = crate::shadow::card_room_kept().saturating_add(targets_room_kept());
             counted(budget, used, crate::pool::texture_room(), kept, crate::pool::pack()) < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -2259,7 +2273,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 #[cfg(any(windows, test))]
 fn counted(budget: u64, used: u64, pool_free: u64, kept: u64, packed: bool) -> u64 {
     let free = if packed && crate::pool::over_line(budget, used) { 0 } else { pool_free };
-    used.saturating_sub(free) + kept
+    used.saturating_sub(free).saturating_add(kept)
 }
 
 /// The budget line beside the pool lines, every 5 s: how far the card is
@@ -2279,7 +2293,7 @@ pub(crate) fn budget_line(memory: Option<[u64; 4]>) -> String {
 #[cfg(any(windows, test))]
 fn budget_line_of(budget: u64, used: u64, pool_free: u64, kept: [u64; 2], packed: bool, percent: u64) -> String {
     let mb = |n: u64| (n >> 20) as i64;
-    let ours = counted(budget, used, pool_free, kept[0] + kept[1], packed);
+    let ours = counted(budget, used, pool_free, kept[0].saturating_add(kept[1]), packed);
     let whole = packed && crate::pool::over_line(budget, used);
     format!(
         "budget count: budget {} MB; the system counts {} MB in use, {:+} MB over; the room rule counts {} MB, {:+} MB over \
@@ -2454,7 +2468,7 @@ fn texture_max() -> Option<u64> {
                 // (As the room rule counts it: [`counted`].)
                 let percent = match crate::host::host().and_then(|h| h.video_memory()) {
                     Some([budget, used, ..]) => {
-                        let kept = crate::shadow::card_room_kept() + targets_room_kept();
+                        let kept = crate::shadow::card_room_kept().saturating_add(targets_room_kept());
                         let used = counted(budget, used, crate::pool::texture_room(), kept, crate::pool::pack());
                         (used * 100 / budget.max(1)).min(255)
                     }
@@ -2794,6 +2808,11 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Since the start: host copies made again within a minute of their let-go
+/// (`crate::residency::made_again_soon`), and their bytes.
+#[cfg(windows)]
+pub(crate) static AGAIN_SOON: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Frames for which nothing asked for a host copy that is let go
 /// ([`let_go_idle`]).
 #[cfg(windows)]
@@ -2830,6 +2849,7 @@ fn let_go(r: &Resource, at: usize, idle_ms: u64, why: crate::residency::Churn) -
     };
     let (host, _twin) = gone?;
     r.host.gone.store(true, Relaxed);
+    r.host.let_go_at.store(crate::host::coarse_ms().max(1), Relaxed);
     KINDS[2].fetch_add(1, Relaxed);
     KINDS[3].fetch_add(host.bytes, Relaxed);
     crate::residency::note(why, 1);
@@ -2913,6 +2933,88 @@ fn empty_blocks(memory: Option<[u64; 4]>, all: &std::collections::BTreeSet<usize
     }
 }
 
+/// A host copy [`let_go_pressured`] may let go: how long ago it was used
+/// (smaller: longer ago), its title texture, the pool block its piece lies
+/// in, whether its staging buffer is one of its own, and its bytes.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct MayGo {
+    age: u64,
+    at: usize,
+    block: Option<u32>,
+    own: bool,
+    bytes: u64,
+}
+
+/// What [`let_go_pressured`] lets go, in order: every copy in the blocks
+/// `chosen` to come back whole (they hold `most` bytes at most), then those
+/// with a staging buffer of their own, the longest idle first, as long as
+/// the bytes stay within `most`. A copy that gives neither back stays: its
+/// piece would lie empty in a block that is kept.
+#[cfg(any(windows, test))]
+fn pressure_plan(may: &mut [MayGo], chosen: &[u32], most: u64) -> Vec<usize> {
+    may.sort_unstable_by_key(|m| (m.age, m.at));
+    let whole = |m: &MayGo| m.block.is_some_and(|b| chosen.contains(&b));
+    let mut plan: Vec<usize> = may.iter().filter(|m| whole(m)).map(|m| m.at).collect();
+    let mut bytes: u64 = may.iter().filter(|m| whole(m)).map(|m| m.bytes).sum();
+    for m in may.iter().filter(|m| m.own && !whole(m)) {
+        if bytes.saturating_add(m.bytes) > most {
+            break;
+        }
+        bytes += m.bytes;
+        plan.push(m.at);
+    }
+    plan
+}
+
+/// [`let_go_idle`] under PC memory pressure with
+/// `crate::residency::pressure_keep`: lets go of the host copies idle for
+/// their keep (`crate::residency::pressure_idle_ms`) that give memory back,
+/// `crate::residency::PRESSURE_MOST` bytes at most ([`pressure_plan`]). The
+/// pool chooses the blocks to come back whole among those all of whose
+/// copies may go, whether it is packed or not (`crate::pool::empty_out`).
+/// `own`: the textures with a staging buffer of their own
+/// (`crate::texture::own_staging`). `all`: the title textures, under their
+/// lock. The copies let go and their bytes, and the first.
+#[cfg(windows)]
+fn let_go_pressured(all: &std::collections::BTreeSet<usize>, own: &std::collections::HashSet<usize>) -> (u64, u64, Option<usize>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let keep = |r: &Resource| crate::residency::pressure_idle_ms(r.host.keep_ms.load(Relaxed));
+    let mut idle: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    let mut may = Vec::new();
+    for &at in all {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock the caller holds (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        let used = r.host.used.load(Relaxed);
+        let idle_ms = keep(r);
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, _)) = made.as_ref().filter(|(host, _)| idle_copy(r, host, idle_ms)) else {
+            continue;
+        };
+        let piece = crate::pool::piece_of(&host.texture);
+        if let Some((block, len)) = piece {
+            *idle.entry(block).or_default() += len;
+        }
+        may.push(MayGo { age: used & 0xffff_ffff, at, block: piece.map(|(block, _)| block), own: own.contains(&at), bytes: host.bytes });
+    }
+    let chosen = if idle.is_empty() { Vec::new() } else { crate::pool::empty_out(crate::residency::PRESSURE_MOST, &idle) };
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    for at in pressure_plan(&mut may, &chosen, crate::residency::PRESSURE_MOST) {
+        // SAFETY: as above.
+        let r = unsafe { &*(at as *const Resource) };
+        if let Some(freed) = let_go(r, at, keep(r), crate::residency::Churn::Idle) {
+            went += 1;
+            bytes += freed;
+            first.get_or_insert(at);
+        }
+    }
+    (went, bytes, first)
+}
+
 #[cfg(any(windows, test))]
 fn sweep_batch(all: &std::collections::BTreeSet<usize>, from: usize, limit: usize) -> impl Iterator<Item = usize> + '_ {
     // The last batch can end exactly at the final address, or the
@@ -2964,19 +3066,31 @@ pub(crate) fn let_go_idle() {
         }
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
+    if crate::residency::pressured() && crate::residency::pressure_keep() {
+        // (Before the textures' lock, which `let_go` takes the staging's
+        // under.)
+        let own = crate::texture::own_staging();
+        let all = textures();
+        let began = std::time::Instant::now();
+        let (went, bytes, first) = let_go_pressured(&all, &own);
+        swept(memory, &all, began, went, bytes, first);
+        return;
+    }
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     // The card's room says nothing of the PC's: what the card spills to
     // system memory is commit too. Short of it ([`crate::residency::pressured`],
     // never with `VICTORY_RESIDENCY=0`), idle copies go after seconds, not
-    // the minutes room on the card keeps them.
+    // the minutes room on the card keeps them (`VICTORY_PRESSURE_KEEP=1`:
+    // [`let_go_pressured`] above).
     let (idle_ms, most) = match memory {
         _ if crate::residency::pressured() => (5_000, u64::MAX),
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
+            let used = used
+                .saturating_sub(crate::pool::texture_room())
+                .saturating_add(crate::shadow::card_room_kept())
+                .saturating_add(targets_room_kept());
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -3042,11 +3156,29 @@ pub(crate) fn let_go_idle() {
             }
         }
     }
+    swept(memory, &all, began, went, bytes, first);
+}
+
+/// The end of a look of [`let_go_idle`] begun at `began` that let `went`
+/// host copies go, `bytes` of them, `first` the first: its time
+/// ([`SWEPT_US`]), the blocks to empty while the pool is packed
+/// ([`empty_blocks`]), and the trail. `all`: the title textures, under
+/// their lock.
+#[cfg(windows)]
+fn swept(
+    memory: Option<[u64; 4]>,
+    all: &std::collections::BTreeSet<usize>,
+    began: std::time::Instant,
+    went: u64,
+    bytes: u64,
+    first: Option<usize>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
     if crate::pool::pack() {
-        empty_blocks(memory, &all);
+        empty_blocks(memory, all);
     }
     if went > 0 {
         crate::host::trail(|| {
@@ -3696,6 +3828,8 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             no_room: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
+            let_go_at: std::sync::atomic::AtomicU64::new(0),
+            keep_ms: std::sync::atomic::AtomicU32::new(0),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
@@ -4832,8 +4966,16 @@ mod tests {
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
-        // The upload list holds the texture until it is reset.
-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        // The upload list holds the texture until it is reset. With
+        // `VICTORY_THIN=1` (the play set; it needs the line of submissions)
+        // the title's copy is only written down at the call and translated,
+        // which is when the list takes hold of the texture, by a thread of
+        // ours that may not have come to it yet: the hold is asked only
+        // where recording happens at the call (ticket 153). `execute` below
+        // drains the title's queues first, so the read-back is the same.
+        if !crate::list::thin::on() {
+            assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        }
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),
@@ -5666,6 +5808,35 @@ float4 lit() : SV_Target { return 1.0; }
     }
 
     #[test]
+    fn under_pressure_only_whole_blocks_and_own_staging_go_within_the_limit() {
+        const MB: u64 = 1 << 20;
+        let may = |age, at, block, own, mb| MayGo { age, at, block, own, bytes: mb * MB };
+        let mut all = vec![
+            // Block 1, chosen: both go, whatever their age or the limit.
+            may(50, 0x10, Some(1), false, 40),
+            may(10, 0x20, Some(1), false, 20),
+            // Block 2, not chosen: its piece would lie empty in a kept block.
+            may(1, 0x30, Some(2), false, 1),
+            // Staging of their own, the longest idle first, while within 128 MB.
+            may(30, 0x40, None, true, 50),
+            may(5, 0x50, Some(2), true, 10),
+            may(20, 0x60, None, true, 30),
+            // Neither.
+            may(2, 0x70, None, false, 1),
+        ];
+        assert_eq!(pressure_plan(&mut all, &[1], 128 * MB), [0x20, 0x10, 0x50, 0x60]);
+        // With room for all of them, in that order.
+        assert_eq!(pressure_plan(&mut all, &[1], 256 * MB), [0x20, 0x10, 0x50, 0x60, 0x40]);
+        // No block chosen.
+        assert_eq!(pressure_plan(&mut all, &[], 128 * MB), [0x50, 0x60, 0x40]);
+        assert_eq!(pressure_plan(&mut all, &[], 60 * MB), [0x50, 0x60]);
+        // A copy past the limit stops the rest: none younger jumps it.
+        let mut big = vec![may(1, 0x80, None, true, 200), may(2, 0x90, None, true, 1)];
+        assert!(pressure_plan(&mut big, &[], 128 * MB).is_empty());
+        assert!(pressure_plan(&mut [], &[1], 128 * MB).is_empty());
+    }
+
+    #[test]
     fn idle_sweep_restarts_after_a_full_last_batch() {
         let all = std::collections::BTreeSet::from([1, 3, 5, 7]);
         assert_eq!(sweep_batch(&all, 0, 2).collect::<Vec<_>>(), [1, 3]);
@@ -5717,6 +5888,8 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(counted(mb(10000), mb(9500), mb(2700), 0, true), mb(9500));
         // More free than in use (the system has moved blocks off the card).
         assert_eq!(counted(mb(9100), mb(1000), mb(2700), mb(300), false), mb(300));
+        // What is kept never wraps the count (ticket 156: the sums saturate).
+        assert_eq!(counted(mb(9100), mb(9000), 0, u64::MAX, false), u64::MAX);
         assert_eq!(
             budget_line_of(mb(9100), mb(9500), mb(2700), [mb(100), mb(200)], false, 90),
             "budget count: budget 9100 MB; the system counts 9500 MB in use, +400 MB over; the room rule counts 7100 MB, \

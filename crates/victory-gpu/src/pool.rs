@@ -112,7 +112,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
-            1
+            // (Ticket 124: all of them, before any texture goes.)
+            usize::from(!crate::residency::pressure_keep())
         } else {
             limit
         };
@@ -132,13 +133,64 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
 
+/// How long a piece of staging memory rests: `VICTORY_STAGING_REST_MS`
+/// (Op-lite's memory audit, item 1; unset: [`REST`], as for textures). A
+/// staging piece is given back only after the list that copies from it
+/// has run and was reset, so it needs no rest against a device loss as a
+/// texture's piece does; while it rests its block cannot empty, and the
+/// staging blocks follow the uploads of the last 2.5 s (theirs: 0.7 to
+/// 3.4 GB of blocks for 60 to 240 MB of live staging; ours 320 MB for 50).
+/// Try 250.
+fn staging_rest() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = rest_ms(std::env::var("VICTORY_STAGING_REST_MS").ok().as_deref());
+        if ms != REST {
+            tracing::info!(ms, "staging pieces rest {ms} ms before they are used again (VICTORY_STAGING_REST_MS; usually {REST})");
+        }
+        ms
+    })
+}
+
+/// What `VICTORY_STAGING_REST_MS` says: milliseconds, [`REST`] if it is
+/// unset or no number.
+fn rest_ms(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(REST)
+}
+
 fn now() -> u64 {
     crate::host::now_ms()
 }
 
+/// `VICTORY_TEXTURE_POOL` as (textures cut from blocks in the card's
+/// memory, staging cut from blocks of upload memory): unset or anything
+/// else both, as before; `0` neither; `staging` (after
+/// Voltexs/VIctory-RTXNvidia 295fd537) the staging only: every texture is
+/// a resource of its own in the card's memory, so no 64 MiB block is held
+/// by a few small textures in use (session 0152: 84 blocks, 5.4 GB, for
+/// 2.6-3.1 GB of textures), while uploads still come from pooled staging.
+fn pool_value(value: Option<&str>) -> (bool, bool) {
+    match value {
+        Some("0") => (false, false),
+        Some(v) if v.eq_ignore_ascii_case("staging") => (false, true),
+        _ => (true, true),
+    }
+}
+
+fn pool_setting() -> (bool, bool) {
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pool_value(std::env::var("VICTORY_TEXTURE_POOL").ok().as_deref()))
+}
+
+/// Whether textures are cut from blocks in the card's memory
+/// ([`pool_value`]).
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
+    pool_setting().0
+}
+
+/// Whether staging memory for uploads is cut from blocks ([`pool_value`]).
+fn staging_on() -> bool {
+    pool_setting().1
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -298,6 +350,9 @@ struct Pool<B> {
     /// to empty ([`Pool::empty_out`]).
     returned: u64,
     emptied: u64,
+    /// Milliseconds a piece given back rests ([`REST`]; the staging pool's
+    /// may be set, [`staging_rest`]).
+    rest: u64,
 }
 
 impl<B: Clone> Pool<B> {
@@ -311,6 +366,7 @@ impl<B: Clone> Pool<B> {
             textures: 0,
             returned: 0,
             emptied: 0,
+            rest: REST,
         }
     }
 
@@ -452,7 +508,7 @@ impl<B: Clone> Pool<B> {
 
     fn give(&mut self, piece: Piece, now: u64) {
         self.textures = self.textures.saturating_sub(piece.real);
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + self.rest, piece));
     }
 
     /// Counts `real` as the texture's own size inside `piece` (the piece's
@@ -788,6 +844,12 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The bytes of the blocks of textures and of staging given back since the
+/// start (the residency line).
+pub(crate) fn given_back_bytes() -> u64 {
+    (lock(&TEXTURES).returned + lock(&STAGING).returned) * BLOCK
+}
+
 /// Bytes of the pieces textures hold now.
 static HELD: AtomicU64 = AtomicU64::new(0);
 
@@ -856,12 +918,14 @@ impl Drop for StagingPiece {
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
-    if !on() {
+    if !staging_on() {
         return None;
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut pool = lock(&STAGING);
+    pool.rest = staging_rest();
+    let taken = pool.take(bytes, 512, now(), || {
         // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
         // while commit is short; those a draw samples now still get one.)
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
@@ -871,7 +935,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    });
+    drop(pool);
+    let (piece, memory, again) = taken?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -1217,6 +1283,21 @@ pub(crate) unsafe fn texture(
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_TEXTURE_POOL`: unset and other values pool both, `0` neither,
+    /// `staging` only the staging.
+    #[test]
+    fn texture_pool_staging_keeps_only_the_staging_pooled() {
+        use super::pool_value;
+        assert_eq!(pool_value(None), (true, true));
+        assert_eq!(pool_value(Some("1")), (true, true));
+        assert_eq!(pool_value(Some("")), (true, true));
+        assert_eq!(pool_value(Some("0")), (false, false));
+        // Only `0` itself turns it off, as before.
+        assert_eq!(pool_value(Some(" 0 ")), (true, true));
+        assert_eq!(pool_value(Some("staging")), (false, true));
+        assert_eq!(pool_value(Some("Staging")), (false, true));
+    }
+
     use super::*;
 
     #[test]
@@ -1713,5 +1794,33 @@ mod tests {
         assert_eq!(to_return(Some([mb(9100), mb(8600), 0, 0]), true), BLOCK);
         assert_eq!(to_return(None, true), BLOCK);
         assert_eq!(to_return(None, false), 0);
+    }
+}
+
+#[cfg(test)]
+mod rest_tests {
+    use super::*;
+
+    /// The staging pool's own rest: unset it is the textures' rest; set
+    /// shorter, a piece given back is used again that much sooner.
+    #[test]
+    fn a_pool_s_own_rest_lets_a_piece_back_sooner() {
+        assert_eq!(rest_ms(None), REST);
+        assert_eq!(rest_ms(Some("soon")), REST);
+        assert_eq!(rest_ms(Some(" 250 ")), 250);
+        let mut pool: Pool<u32> = Pool::new(STAGING_KEPT);
+        assert_eq!(pool.rest, REST);
+        pool.rest = 250;
+        let make = || Some(7u32);
+        let (a, _, _) = pool.take(BLOCK / 2, 512, 0, make).unwrap();
+        let (full, _, _) = pool.take(BLOCK / 2, 512, 0, make).unwrap();
+        assert_eq!((a.block, full.block), (0, 0));
+        pool.give(a, 100);
+        // Still resting: a second block is made.
+        let (b, _, _) = pool.take(BLOCK / 2, 512, 100 + 249, make).unwrap();
+        assert_eq!(b.block, 1);
+        // Rested: the first block's memory is taken again.
+        let (c, _, again) = pool.take(BLOCK / 2, 512, 100 + 250, make).unwrap();
+        assert_eq!((c.block, again), (0, true));
     }
 }

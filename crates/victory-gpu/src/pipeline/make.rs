@@ -91,6 +91,10 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         if builder {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
+        // `VICTORY_PROBE_RAYS=1`: made, and its rays find nothing.
+        if probe_rays() {
+            return false;
+        }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
@@ -104,9 +108,44 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         victory_shader::bvh::rt_miss() && !builder && !trace
     });
     if skip_trace {
-        return shaders.iter().filter(|s| s.stage == "compute").find_map(|s| traces_structures(&s.container));
+        return shaders
+            .iter()
+            .filter(|s| s.stage == "compute")
+            .find_map(|s| traces_structures(&s.container))
+            .filter(|name| !(probe_rays() && probe_traces(name)));
     }
     None
+}
+
+/// `VICTORY_PROBE_RAYS=1` (tickets 141 and 138; off unless the value is
+/// `1`; after oplite/scarlett-fox 183ac80fe): with the structure builder
+/// off and every ray a miss (`VICTORY_RT_MISS=1`), the screen probes'
+/// two ray programs are made all the same: `CS_ScreenProbes_ActivateRays`
+/// and `CS_ScreenProbes_TraceRays*_BVH*`. Left out, no probe is ever
+/// traced and each keeps what its memory held, so what only the probes
+/// light (every face the sun does not reach) stays black or takes a stale
+/// colour. Made, each ray ends at its first node with the miss the title
+/// computes for a ray that finds nothing (`emit::intersect` `bvh_miss`),
+/// and the probes take the sky's light. The reflections' and the hair's
+/// programs stay left out (`VICTORY_RT_TRACE=1` makes those too). Nothing
+/// is translated differently: the answer is `VICTORY_RT_MISS`'s.
+fn probe_rays() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PROBE_RAYS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                rt_miss = victory_shader::bvh::rt_miss(),
+                "the screen probes' ray programs are made and their rays find nothing (VICTORY_PROBE_RAYS=1; needs VICTORY_RT_MISS=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Of [`traces_structures`]' names, the one [`probe_rays`] has made.
+fn probe_traces(name: &str) -> bool {
+    name == "CS_ScreenProbes_TraceRays_BVH"
 }
 
 /// The tracing against the ray structures, and the hair's geometry made
@@ -429,9 +468,39 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.graphics.is_none() && compute_waits() {
+            // Made here, or waited for while a worker makes it.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes (run 195).
+/// A wait of seconds once (the pipeline library has it on the next run)
+/// against a picture wrong until the scene ends.
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=1`; off by default here (on in the
+/// origin fork): within the budget, as before, until an A/B at the gate.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| compute_waits_value(std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT").ok().as_deref()))
+}
+
+/// [`compute_waits`] for the switch's value: on only at `1`.
+fn compute_waits_value(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.
@@ -847,6 +916,15 @@ fn shader_bytes(bytes: &[u8]) -> Arc<super::Shader> {
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_PIPELINE_COMPUTE_WAIT`: off unless `1` (origin's default is on).
+    #[test]
+    fn dispatches_wait_for_their_pipeline_only_with_the_switch() {
+        assert!(!super::compute_waits_value(None));
+        assert!(!super::compute_waits_value(Some("0")));
+        assert!(!super::compute_waits_value(Some("on")));
+        assert!(super::compute_waits_value(Some("1")));
+    }
+
     use super::*;
 
     #[test]
@@ -864,6 +942,19 @@ mod tests {
         );
         assert_eq!(traces_structures(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."), None);
         assert_eq!(traces_structures(b"..\0CS_ScreenProbes_ActivateRays_0_Wrapped\0.."), None);
+    }
+
+    #[test]
+    fn probe_rays_keeps_only_the_probes_trace() {
+        let probes = traces_structures(b"..CS_ScreenProbes_TraceRays_Direct_BVH..").unwrap();
+        assert!(probe_traces(probes));
+        let reflections = traces_structures(b"..CS_RaytraceVBuffer_Opaque..").unwrap();
+        assert!(!probe_traces(reflections));
+        let hair = traces_structures(b"..CSGenerateHairVB..").unwrap();
+        assert!(!probe_traces(hair));
+        // The forms that march the title's voxels are never left out.
+        assert_eq!(traces_structures(b"..CS_ScreenProbes_TraceRays_Fallback.."), None);
+        assert_eq!(traces_structures(b"..CS_RaytraceVBuffer_Voxels.."), None);
     }
 
     #[test]

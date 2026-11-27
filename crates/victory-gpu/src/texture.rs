@@ -43,8 +43,9 @@ pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Where in `buffer` it begins (the footprints count from there).
     base: u64,
-    /// Back in the pool with the last list that names it.
-    _piece: Option<crate::pool::StagingPiece>,
+    /// Back in the pool with the last list that names it (`None`: a buffer
+    /// of its own, [`own_staging`]).
+    piece: Option<crate::pool::StagingPiece>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -935,6 +936,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     });
 }
 
+// The list and the D3D12 objects one texture upload records with: the texture, its staging and source buffers.
+#[allow(clippy::too_many_arguments)]
 fn record_upload(
     list: &HostList,
     resource: This,
@@ -1855,6 +1858,16 @@ impl Staging {
     }
 }
 
+/// The title textures whose staging buffer is one of their own, not a piece
+/// of a pooled block: letting such a texture go gives that system memory
+/// back whole once the lists that name it have run (ticket 124).
+pub(crate) fn own_staging() -> std::collections::HashSet<usize> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .map(|map| map.iter().filter(|(_, s)| s.piece.is_none()).map(|(&at, _)| at).collect())
+        .unwrap_or_default()
+}
+
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
@@ -1914,6 +1927,113 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
     u64::from_le_bytes(first) | 1
+}
+
+/// The most bytes [`fingerprint_texture`] reads whole for a texture whose
+/// pages the title also shows at other addresses
+/// (`VICTORY_ALIASED_PRINT_KB=<KiB>`; kitty's `K6_FULL_PRINT_KB` when ours
+/// is unset; unset or 0: never, [`fingerprint`]'s three 16 KiB windows for
+/// all, as before; kitty's own default is 4096).
+fn aliased_print_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let kb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let kb = kb("VICTORY_ALIASED_PRINT_KB").or_else(|| kb("K6_FULL_PRINT_KB")).unwrap_or(0);
+        if kb > 0 {
+            tracing::info!(
+                "textures picked by index shown at other addresses too are fingerprinted whole up to {kb} KiB \
+                 (VICTORY_ALIASED_PRINT_KB)"
+            );
+        }
+        kb.saturating_mul(1 << 10)
+    })
+}
+
+/// Whether the title shows some 64 KiB page of `[at, at + len)` at another
+/// address too: what it writes there the guards and the runtime tell of at
+/// that address alone, so the texture changes with nothing to tell of it.
+pub(crate) fn aliased(at: u64, len: u64) -> bool {
+    !crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize).is_empty()
+}
+
+/// Whether [`fingerprint_texture`] reads `len` bytes whole: more than
+/// [`fingerprint`] reads whole anyway (48 KiB), at most `most`, and shown at
+/// other addresses too. Pure, for testing.
+fn print_whole(len: u64, most: usize, aliased: impl FnOnce() -> bool) -> bool {
+    len > 48 << 10 && len as usize <= most && aliased()
+}
+
+/// A fingerprint of all of title memory `[at, at + len)`, 64 KiB at a time,
+/// never 0 (read through the kernel as [`fingerprint`]).
+fn fingerprint_whole(at: u64, len: u64) -> u64 {
+    const WINDOW: usize = 64 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let n = len as usize;
+    let mut print = 0x6b36_u128;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(WINDOW, 0);
+        let mut from = 0;
+        while from < n {
+            let bytes = WINDOW.min(n - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            from += bytes;
+        }
+    });
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+    u64::from_le_bytes(first) | 1
+}
+
+/// The fingerprint the texture pass keeps for an uploaded texture picked by
+/// index at title memory `[at, at + len)`: [`fingerprint`]'s, but of all of
+/// it for a texture whose pages are shown at other addresses too
+/// ([`aliased`]), up to [`aliased_print_bytes`] (off unless set). The title
+/// paints such textures (faces, hair) through the other view a part at a
+/// time; a part outside the three sampled windows went unseen and stayed
+/// stale on the card (blocky tiles). After kitty ae3cce821. The same memory
+/// gives the same print as long as its aliasing stands; a change of that
+/// costs one upload more.
+pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
+    if print_whole(len, aliased_print_bytes(), || aliased(at, len)) {
+        fingerprint_whole(at, len)
+    } else {
+        fingerprint(at, len)
+    }
+}
+
+#[cfg(test)]
+mod aliased_print_tests {
+    use super::{fingerprint, fingerprint_whole, print_whole};
+
+    /// A part painted outside the three 16 KiB windows changes the whole
+    /// print, never the sampled one (kitty ae3cce821: blocky face tiles).
+    #[test]
+    fn a_change_outside_the_sampled_windows_shows_only_in_the_whole_print() {
+        let mut bytes = vec![7u8; 256 << 10];
+        let at = bytes.as_ptr() as u64;
+        let len = bytes.len() as u64;
+        let (sampled, whole) = (fingerprint(at, len), fingerprint_whole(at, len));
+        // 40 KiB in: past the first window, before the middle one.
+        bytes[40 << 10] ^= 0xff;
+        let at = bytes.as_ptr() as u64;
+        assert_eq!(fingerprint(at, len), sampled, "the windows saw the change");
+        assert_ne!(fingerprint_whole(at, len), whole, "the whole print missed the change");
+        assert_ne!(whole, 0);
+    }
+
+    #[test]
+    fn only_aliased_textures_within_the_limit_are_read_whole() {
+        let most = 4096 << 10;
+        assert!(print_whole(256 << 10, most, || true));
+        assert!(!print_whole(256 << 10, most, || false), "not shown elsewhere");
+        assert!(!print_whole(256 << 10, 0, || true), "off (unset)");
+        assert!(!print_whole(48 << 10, most, || true), "read whole anyway");
+        assert!(!print_whole((4096 << 10) + 1, most, || true), "over the limit");
+    }
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -2244,7 +2364,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let s = Arc::new(Staging {
         buffer,
         base,
-        _piece: piece,
+        piece,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,

@@ -33,6 +33,9 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Rust allocations through mimalloc instead of the shared process heap (off
+# unless asked: --features mimalloc; kitty-core 8a9584536 has it in default).
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true

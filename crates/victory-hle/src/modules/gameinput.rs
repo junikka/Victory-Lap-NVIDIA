@@ -1851,9 +1851,11 @@ mod host {
     }
 
     /// How long a scripted key stays down unless its line says.
+    #[cfg(any(test, feature = "diagnostics"))]
     const KEY_TAP: Duration = Duration::from_millis(200);
     /// The pause after each held line of `VICTORY_KEYS_FILE`, so the next
     /// reads as a separate press.
+    #[cfg(any(test, feature = "diagnostics"))]
     const KEY_GAP: Duration = Duration::from_millis(200);
 
     /// Without diagnostics there is no key file.
@@ -1893,6 +1895,7 @@ mod host {
     }
 
     /// One line of a key file: keys held together for a time (none: a wait).
+    #[cfg(any(test, feature = "diagnostics"))]
     #[derive(Clone, Debug, PartialEq)]
     struct Step {
         keys: Vec<u8>,
@@ -1906,6 +1909,7 @@ mod host {
     /// still being written waits for its newline. Each step starts where
     /// the one before ended, not where it was next looked at, so a route
     /// keeps its timing however often the title polls.
+    #[cfg(any(test, feature = "diagnostics"))]
     #[derive(Default)]
     struct KeyFeed {
         /// Bytes of the text already read.
@@ -1915,6 +1919,7 @@ mod host {
         playing: Option<(Instant, Step)>,
     }
 
+    #[cfg(any(test, feature = "diagnostics"))]
     impl KeyFeed {
         fn feed(&mut self, text: &str) {
             let Some(new) = text.get(self.read..) else {
@@ -1966,6 +1971,7 @@ mod host {
     }
 
     /// A key file line as a step.
+    #[cfg(any(test, feature = "diagnostics"))]
     fn step(line: &str) -> Option<Step> {
         let mut words = line.split_whitespace();
         let first = words.next()?;

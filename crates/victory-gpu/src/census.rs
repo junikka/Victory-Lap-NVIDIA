@@ -132,6 +132,73 @@ pub(crate) fn skip_wc_back() -> Skip {
     })
 }
 
+/// `VICTORY_SKIP_WC_BACK_HOLD=1` (off by default; read only with
+/// [`skip_wc_back`] on): a piece the rules would leave on the card is held
+/// there through `crate::lazy_back` instead (ticket 110): every address the
+/// title sees its page at is made unreadable together, so a later read of
+/// the title's, through any of them, faults, lands what the shaders wrote
+/// and reads it. Nothing is noted stale and nothing is fetched until then
+/// (or until lazy_back's own landings: a write of ours there, another copy
+/// asking, idle frames). A piece that cannot be held (its block is no view
+/// of ours, not guarded at every address, hot, held by another copy) is
+/// fetched as without the switch: it is never left unguarded.
+///
+/// With it, a page shown at more than one address is no longer refused
+/// outright: the rules of `1` and `2` are asked of each of its addresses
+/// ([`Pages::may_hold`]), and with `1` no live copy may cover any address
+/// but the writer's own. Needs what lazy_back rests on (VICTORY_RELAY,
+/// VICTORY_LAND, VICTORY_LAND_BESIDE as by default); without that it stays
+/// off with a warning, and `1` and `2` leave pieces as before.
+pub(crate) fn hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if skip_wc_back() == Skip::Off || !std::env::var("VICTORY_SKIP_WC_BACK_HOLD").is_ok_and(|v| v.trim() == "1") {
+            return false;
+        }
+        let can = crate::lazy_back::can();
+        if can {
+            tracing::warn!(
+                "VICTORY_SKIP_WC_BACK_HOLD=1: pieces VICTORY_SKIP_WC_BACK leaves are held unreadable at every address instead, \
+                 and land when the title looks"
+            );
+        } else {
+            tracing::warn!(
+                "VICTORY_SKIP_WC_BACK_HOLD=1 is left off: it needs VICTORY_RELAY, VICTORY_LAND and VICTORY_LAND_BESIDE as they \
+                 are by default"
+            );
+        }
+        can
+    })
+}
+
+/// `VICTORY_SKIP_WC_MIN_KB=N` (read only with [`skip_wc_back`] on; unset or
+/// 0: every size, as before): copies of title buffers under N KiB always
+/// come back, held or not. After grosterr/rtx3060 857308712 and 53a48f6c3
+/// (default 1024 there, the name of fxceless/victory-fork#1163): small
+/// write-combining buffers hold counts and visibility lists the title's CPU
+/// reads; left on the card they gave flashes and half the draws there.
+/// Their compare-skip half (`VICTORY_SKIP_WC_COMPARE`) is not here (see
+/// [`skip_wc_back`]).
+pub(crate) fn skip_wc_min_bytes() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_WC_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).saturating_mul(1024)
+    })
+}
+
+/// What [`skip_back`] decides for a flagged piece.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Back {
+    /// Fetched and merged, as without the switch.
+    Fetch,
+    /// Left on the card, title memory noted stale.
+    Leave,
+    /// To be held on the card through `crate::lazy_back` ([`hold`]);
+    /// fetched if it cannot be. Whether the page is shown at more than one
+    /// address.
+    Hold(bool),
+}
+
 /// `VICTORY_SKIP_WC_BACK_CHECK=N` (N at least 2; off by default): one
 /// landing in every N frames leaves nothing on the card ([`skip_wc_back`]).
 pub(crate) fn check_every() -> u64 {
@@ -183,6 +250,10 @@ fn reservations() -> MutexGuard<'static, BTreeMap<usize, Reservation>> {
 /// at an address of its choice), with the title's own `kind`, XMem `flags`
 /// and console `protect` (before the runtime cleans them).
 pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
+    // The account by owner (`VICTORY_MEMORY_ACCOUNT`): the title's own,
+    // wherever it lies (a reservation may lie above the console's 1 TiB).
+    #[cfg(feature = "diagnostics")]
+    crate::account::title(at, len as u64);
     if !tracking() || at == 0 || len == 0 {
         return;
     }
@@ -297,7 +368,17 @@ mod n {
     pub(super) const CHECK_FETCHED: usize = 30;
     pub(super) const CHECK_WRITTEN: usize = 31;
     pub(super) const CHECK_STALE: usize = 32;
-    pub(super) const COUNT: usize = 33;
+    /// `VICTORY_SKIP_WC_BACK_HOLD`: pieces and bytes held on the card, of
+    /// them in pages shown at more than one address, and pieces the rules
+    /// allowed that lazy_back could not hold (fetched).
+    pub(super) const HELD_PIECES: usize = 33;
+    pub(super) const HELD: usize = 34;
+    pub(super) const HELD_MULTI: usize = 35;
+    pub(super) const HOLD_REFUSED: usize = 36;
+    /// WC bytes fetched in pages shown at more than one address that the
+    /// rules of [`super::hold`] (with `2`) would allow at every address.
+    pub(super) const WC_MULTI_HOLDABLE: usize = 37;
+    pub(super) const COUNT: usize = 38;
 }
 
 static COUNTS: [AtomicU64; n::COUNT] = [const { AtomicU64::new(0) }; n::COUNT];
@@ -487,6 +568,22 @@ impl Pages {
             && (mode != Skip::Alone || self.covered(page) <= 1)
     }
 
+    /// [`super::hold`]: whether copy `owner` may hold a piece of `page` on
+    /// the card when the title also shows that page at `aliases` (pages,
+    /// not `page`): [`Pages::may_skip`] at `page`, and at every alias no
+    /// other copy took a card write or wrote it back, and with
+    /// [`Skip::Alone`] no live copy covers it (not even `owner`: its bytes
+    /// at the alias come from title memory too). A hold makes every address
+    /// unreadable together, so a read through any of them lands it.
+    fn may_hold(&self, mode: Skip, owner: u64, page: usize, aliases: &[usize]) -> bool {
+        self.may_skip(mode, owner, page)
+            && aliases.iter().all(|&alias| {
+                !self.taken.contains(&alias)
+                    && self.written.get(&alias).is_none_or(|w| w.owner == owner && !w.stale)
+                    && (mode != Skip::Alone || self.covered(alias) == 0)
+            })
+    }
+
     /// Copy `owner` left title bytes `[lo, hi)` (inside one page) on the
     /// card ([`Pages::may_skip`] said it may).
     fn left(&mut self, owner: u64, lo: usize, hi: usize) {
@@ -644,24 +741,42 @@ pub(crate) fn copy_gone(id: u64, start: u64, len: u64) {
     }
 }
 
+/// The other pages the title shows title page `page` (an index) at.
+fn aliases(page: usize) -> Vec<usize> {
+    crate::inplace::pages_of(page * PAGE).into_iter().map(|at| at / PAGE).filter(|&other| other != page).collect()
+}
+
 /// [`skip_wc_back`]: whether piece `[lo, hi)` (offsets) of copy `which`,
 /// flagged by the card's compare under the declared title range
-/// `declared`, is left on the card instead of being fetched back. Not in a
-/// check landing (`check`, [`check_landing`]). See [`skip_wc_back`] for
-/// the rules.
-pub(crate) fn skip_back(which: Which, declared: (usize, usize), lo: usize, hi: usize, check: bool) -> bool {
+/// `declared`, is left on the card instead of being fetched back, or (with
+/// [`hold`]) is to be held there. Not in a check landing (`check`,
+/// [`check_landing`]). See [`skip_wc_back`] for the rules.
+pub(crate) fn skip_back(which: Which, declared: (usize, usize), lo: usize, hi: usize, check: bool) -> Back {
     let mode = skip_wc_back();
-    if mode == Skip::Off || check || which.window || lo >= hi {
-        return false;
+    if mode == Skip::Off || check || which.window || lo >= hi || which.len < skip_wc_min_bytes() {
+        return Back::Fetch;
     }
     let (a, b) = (which.start as usize + lo, which.start as usize + hi);
-    if !all_wc(&[declared, (a, b)]) || crate::inplace::view_census(a, b - a).1 > 0 {
-        return false;
+    if !all_wc(&[declared, (a, b)]) {
+        return Back::Fetch;
+    }
+    let multi = crate::inplace::view_census(a, b - a).1 > 0;
+    if hold() {
+        // Asked before the pages' lock: the views' is not taken under it.
+        let aliases = if multi { aliases(a / PAGE) } else { Vec::new() };
+        let p = pages();
+        if !p.may_hold(mode, which.id, a / PAGE, &aliases) || p.refetch.contains(&(which.id, a / PAGE)) {
+            return Back::Fetch;
+        }
+        return Back::Hold(multi);
+    }
+    if multi {
+        return Back::Fetch;
     }
     let mut p = pages();
     // A page due to come back ([`refetch_due`]) comes back.
     if !p.may_skip(mode, which.id, a / PAGE) || p.refetch.contains(&(which.id, a / PAGE)) {
-        return false;
+        return Back::Fetch;
     }
     p.left(which.id, a, b);
     noted(&p);
@@ -674,7 +789,28 @@ pub(crate) fn skip_back(which: Which, declared: (usize, usize), lo: usize, hi: u
             COUNTS[n::LEFT].load(Ordering::Relaxed) >> 20
         );
     }
-    true
+    Back::Leave
+}
+
+/// [`hold`]: a piece [`skip_back`] said to hold, `bytes` long (in a page
+/// shown at more than one address: `multi`), was held (`held`) or could
+/// not be, and is fetched.
+pub(crate) fn hold_done(bytes: usize, multi: bool, held: bool) {
+    if !held {
+        count(n::HOLD_REFUSED, 1);
+        return;
+    }
+    count(n::HELD, bytes as u64);
+    if multi {
+        count(n::HELD_MULTI, bytes as u64);
+    }
+    let pieces = COUNTS[n::HELD_PIECES].fetch_add(1, Ordering::Relaxed) + 1;
+    if pieces.is_power_of_two() {
+        tracing::info!(
+            "VICTORY_SKIP_WC_BACK_HOLD: {pieces} pieces ({} MB) of write-combining memory held on the card so far",
+            COUNTS[n::HELD].load(Ordering::Relaxed) >> 20
+        );
+    }
 }
 
 /// Copy `id`'s pages in title memory `[from, to)` that hold bytes left on
@@ -859,6 +995,8 @@ pub(crate) fn merged(which: Which, lo: usize, hi: usize, written: usize, check: 
         count(n::WRITTEN_WC, written as u64);
         let multi = crate::inplace::view_census(a, b - a).1 > 0;
         let page = a / PAGE;
+        // Asked before the pages' lock, as in `skip_back`.
+        let aliases = if multi && !which.window && (on() || hold()) { aliases(page) } else { Vec::new() };
         let mut p = pages();
         // What the rules of `skip_wc_back` would leave of the bytes fetched.
         let mut would = false;
@@ -866,6 +1004,12 @@ pub(crate) fn merged(which: Which, lo: usize, hi: usize, written: usize, check: 
             count(n::WC_WINDOW, bytes);
         } else if multi {
             count(n::WC_MULTI, bytes);
+            if !aliases.is_empty() && p.may_hold(Skip::Untaken, which.id, page, &aliases) {
+                count(n::WC_MULTI_HOLDABLE, bytes);
+            }
+            if hold() {
+                would = p.may_hold(skip_wc_back(), which.id, page, &aliases);
+            }
         } else {
             if p.may_skip(Skip::Alone, which.id, page) {
                 count(n::WC_ALONE, bytes);
@@ -1000,7 +1144,8 @@ fn report_if_due() {
         target: "census",
         "census of the WC bytes fetched, per frame: of title buffers' copies, at one address, {:.1} MB in pages no other live copy \
          covers (what VICTORY_SKIP_WC_BACK=1 leaves on the card), {:.1} MB in pages no other copy took after a card write so far \
-         (=2); {:.1} MB in pages shown at more than one address, {:.1} MB of windows (never left). Taken again after their \
+         (=2); {:.1} MB in pages shown at more than one address ({:.1} MB of it holdable by =2 + HOLD=1), {:.1} MB \
+         of windows (never left). Taken again after their \
          write-back: by the copy that wrote them (the upload echo) {:.1} MB, by other copies {:.2} MB, windows {:.2} MB, copies in \
          place {:.2} MB, textures {:.2} MB; {:.1} pages a frame taken by another for the first time, {taken_since_start} pages \
          since the start, {:.2} pages a frame written back through two copies in turn ({noted} WC pages noted, {covered_pages} \
@@ -1008,6 +1153,7 @@ fn report_if_due() {
         mb(d[n::WC_ALONE]),
         mb(d[n::WC_UNTAKEN]),
         mb(d[n::WC_MULTI]),
+        mb(d[n::WC_MULTI_HOLDABLE]),
         mb(d[n::WC_WINDOW]),
         mb(d[n::ECHO]),
         mb(d[n::TAKEN_COPY]),
@@ -1049,6 +1195,18 @@ fn report_if_due() {
             mb(d[n::CHECK_FETCHED]),
             mb(d[n::CHECK_WRITTEN]),
             mb(d[n::CHECK_STALE]),
+        );
+    }
+    if hold() {
+        tracing::info!(
+            target: "census",
+            "census of VICTORY_SKIP_WC_BACK_HOLD=1, per frame: {:.1} pieces ({:.1} MB) held on the card through the lazy \
+             copy-back, {:.1} MB of them in pages shown at more than one address; {:.1} pieces the rules allowed were fetched, \
+             not holdable (see the lazy copy-back line for why and for what landed)",
+            d[n::HELD_PIECES],
+            mb(d[n::HELD]),
+            mb(d[n::HELD_MULTI]),
+            d[n::HOLD_REFUSED],
         );
     }
     {
@@ -1109,7 +1267,7 @@ fn report_if_due() {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGE, Pages, Reservation, Skip, Took, Which, all_wc_in, check_due, check_landing, on, refetch_due, skip_back, skip_wc_back,
+        Back, PAGE, Pages, Reservation, Skip, Took, Which, all_wc_in, check_due, check_landing, on, refetch_due, skip_back, skip_wc_back,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicU64;
@@ -1282,6 +1440,43 @@ mod tests {
         assert_eq!(p.recopied(1, page + PAGE / 2, page + PAGE), PAGE / 2);
     }
 
+    /// `VICTORY_SKIP_WC_BACK_HOLD`: a page the title shows at two addresses
+    /// is held only if the rules hold at both; with `1` no copy may cover
+    /// the other address, the writer's own included.
+    #[test]
+    fn a_page_at_two_addresses_is_held_only_where_both_allow() {
+        let (page, alias) = (11, 17);
+        let mut p = Pages::default();
+        p.cover(page * PAGE, PAGE, true);
+        for mode in [Skip::Alone, Skip::Untaken] {
+            assert!(p.may_hold(mode, 1, page, &[alias]));
+            assert!(p.may_hold(mode, 1, page, &[]), "at one address: as may_skip");
+        }
+        assert!(!p.may_hold(Skip::Off, 1, page, &[alias]));
+        // Another copy at the other address.
+        p.cover(alias * PAGE, PAGE, true);
+        assert!(!p.may_hold(Skip::Alone, 1, page, &[alias]), "another copy covers the other address");
+        assert!(p.may_hold(Skip::Untaken, 1, page, &[alias]));
+        p.cover(alias * PAGE, PAGE, false);
+        // The writer's own copy over both addresses.
+        p.cover(page * PAGE, (alias - page + 1) * PAGE, true);
+        assert!(!p.may_hold(Skip::Alone, 1, page, &[alias]), "its bytes there come from title memory");
+        p.cover(page * PAGE, (alias - page + 1) * PAGE, false);
+        assert!(p.may_hold(Skip::Alone, 1, page, &[alias]));
+        // Another copy took a card write at the other address.
+        let mut q = Pages::default();
+        q.wrote(1, alias * PAGE, alias * PAGE + 8);
+        assert!(q.may_hold(Skip::Untaken, 1, page, &[alias]), "the writer's own write-back there");
+        q.took(9, alias * PAGE, alias * PAGE + PAGE);
+        assert!(!q.may_hold(Skip::Untaken, 1, page, &[alias]));
+        assert!(q.may_skip(Skip::Untaken, 1, page), "at its own address alone it would be left");
+        // Another copy wrote the other address back.
+        let mut r = Pages::default();
+        r.wrote(2, alias * PAGE, alias * PAGE + 8);
+        assert!(!r.may_hold(Skip::Untaken, 1, page, &[alias]));
+        assert!(r.may_hold(Skip::Untaken, 2, page, &[alias]));
+    }
+
     #[test]
     fn copies_cover_their_pages_until_they_go() {
         let mut p = Pages::default();
@@ -1307,7 +1502,11 @@ mod tests {
         assert!(!check_landing());
         assert!(refetch_due(false).is_none());
         let which = Which { id: 1, start: 0, len: PAGE as u64, window: false };
-        assert!(!skip_back(which, (0, 64), 0, 64, false));
-        assert!(!skip_back(Which { id: 1, start: 0, len: PAGE as u64, window: true }, (0, 64), 0, 64, false));
+        assert!(!super::hold());
+        if std::env::var_os("VICTORY_SKIP_WC_MIN_KB").is_none() {
+            assert_eq!(super::skip_wc_min_bytes(), 0, "every size, unless asked");
+        }
+        assert_eq!(skip_back(which, (0, 64), 0, 64, false), Back::Fetch);
+        assert_eq!(skip_back(Which { id: 1, start: 0, len: PAGE as u64, window: true }, (0, 64), 0, 64, false), Back::Fetch);
     }
 }

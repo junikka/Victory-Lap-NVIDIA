@@ -120,8 +120,8 @@ pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
     /// (title heap, slot): it is made to show our buffer instead.
     Slot(usize, u32),
-    /// A buffer the card can write, filled from its beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer the card can write, and where in it the bytes go.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Title memory something in the air writes: the host copy it goes through
@@ -384,20 +384,45 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
     })
 }
 
+/// Of the writers that meet `[from, to)` (who each writes through, from, to;
+/// in order): the one host copy they all write it through, `None` if none
+/// meets it, or why none holds it.
+fn found_in<'a, T: ?Sized>(
+    writers: impl Iterator<Item = (Option<&'a T>, usize, usize)>,
+    same: impl Fn(&T, &T) -> bool,
+    from: usize,
+    to: usize,
+) -> Result<Option<&'a T>, &'static str> {
+    let mut found: Option<&T> = None;
+    for (who, a, b) in writers {
+        if !meet((a, b), (from, to)) {
+            continue;
+        }
+        match (who, found) {
+            (None, _) => return Err("a read-back or a value behind a flight is written there"),
+            (Some(s), Some(f)) if !same(s, f) => return Err("flights write it through two host copies"),
+            (Some(s), _) => found = Some(s),
+        }
+    }
+    Ok(found)
+}
+
+/// [`found_in`] of `writers`.
+fn found(writers: &[Writer], from: usize, to: usize) -> Result<Option<Arc<Shadow>>, &'static str> {
+    found_in(writers.iter().map(|w| (w.shadow.as_ref(), w.from, w.to)), Arc::ptr_eq, from, to).map(|s| s.cloned())
+}
+
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
-    let mut found: Option<&Arc<Shadow>> = None;
-    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
-        match (&w.shadow, found) {
-            (None, _) => return Err("a read-back or a value behind a flight is written there"),
-            (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
-            (Some(s), _) => found = Some(s),
-        }
-    }
+    held_by(found(writers, from, to)?, from, to)
+}
+
+/// [`holder`], from what [`found`] says of the writers.
+fn held_by(found: Option<Arc<Shadow>>, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
     let shadow = match found {
-        Some(s) => s.clone(),
+        Some(s) => s,
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
@@ -405,6 +430,82 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
+}
+
+/// Whether what the writers say of a place ([`found`]) is asked once for
+/// each stretch of title memory between two of their ends, not once for
+/// each place read (`VICTORY_STEPS_HOLDER_INDEX=1`; off by default: every
+/// place asks every writer, as before).
+///
+/// A fill is taken because a flight may write what it reads, and one flight
+/// in the air declares the whole graphics heap (185 MB) as what its shaders
+/// may write: so each of some 10,000 fills a frame (run path-p16: 9,600 to
+/// 11,000, of 0x1e0, 0x10, 0xc0, 0x160 and 0x120 bytes, each at a place of
+/// its own, so the table by place never answers) went through every range
+/// every flight in the air writes, on the submitting thread: its "planning
+/// steps done on the card", 4.3 ms a frame on the path, 6.9 in the steady
+/// minutes.
+///
+/// What makes it the same answer: between two neighbouring ends of the
+/// writers' ranges no range begins or ends, so a range meets a place that
+/// lies within such a stretch exactly if it covers the stretch
+/// ([`Stretches`], `holder_tests`). The writers that meet it, and their
+/// order, are then the same for every place of the stretch, and so is what
+/// they say. Which host copy holds a place no writer meets, and whether the
+/// copy found holds all of the place, is still asked for each place
+/// ([`held_by`]). A place across an end, or outside all of them, asks every
+/// writer as before; so does everything after a buffer copy done here has
+/// added a writer.
+fn holder_index() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_STEPS_HOLDER_INDEX"))
+}
+
+/// The ends of ranges, in order, each once: the stretches between
+/// neighbours are those within which no range begins or ends.
+struct Stretches(Vec<usize>);
+
+impl Stretches {
+    fn of(ranges: impl Iterator<Item = (usize, usize)>) -> Stretches {
+        let mut ends: Vec<usize> = ranges.flat_map(|(from, to)| [from, to]).collect();
+        ends.sort_unstable();
+        ends.dedup();
+        Stretches(ends)
+    }
+
+    /// The stretch `[from, to)` lies within, if it lies within one.
+    fn within(&self, from: usize, to: usize) -> Option<usize> {
+        if from >= to {
+            return None;
+        }
+        let k = self.0.partition_point(|&end| end <= from).checked_sub(1)?;
+        (to <= *self.0.get(k + 1)?).then_some(k)
+    }
+}
+
+/// With [`holder_index`]: [`holder`] of the same writers for many places.
+struct Holders {
+    stretches: Stretches,
+    /// By stretch: what [`found`] said of a place in it.
+    said: HashMap<usize, Result<Option<Arc<Shadow>>, &'static str>>,
+}
+
+impl Holders {
+    fn of(writers: &[Writer]) -> Holders {
+        Holders {
+            stretches: Stretches::of(writers.iter().map(|w| (w.from, w.to))),
+            said: HashMap::default(),
+        }
+    }
+
+    /// [`holder`] of `writers`, those this was made of.
+    fn holder(&mut self, writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+        let Some(stretch) = self.stretches.within(from, to) else {
+            return holder(writers, from, to);
+        };
+        let said = self.said.entry(stretch).or_insert_with(|| found(writers, from, to));
+        held_by(said.clone()?, from, to)
+    }
 }
 
 /// What the steps of `runs` do, and which step each is (its list by address,
@@ -529,8 +630,8 @@ enum To {
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
-    /// A buffer's beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer, and the offset in it.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -591,6 +692,63 @@ fn record(
             list.ResourceBarrier(&done);
         }
     }
+}
+
+/// Whether the reads of a level that lie beside each other, in the host copy
+/// and in the buffer between alike, are one copy command
+/// (`VICTORY_STEPS_READS_JOIN=1`; off by default: a command for each place, as
+/// before).
+///
+/// Some 10,000 fills a frame are done on the card (run path-p16), nearly all
+/// constants out of the title's ring in the graphics heap, each its own
+/// `CopyBufferRegion` recorded by the submitting thread and its own copy on
+/// the card. The ring gives them out one behind the other, and the places in
+/// the buffer between are given out the same way, each on 256 bytes: where
+/// the title's next place is as far from the last as ours is, the two are
+/// one stretch in both.
+///
+/// What changes: the bytes between two such places (under 256, the title's
+/// own padding) are copied with them into the padding between ours, which
+/// nothing reads: a place begins on 256 bytes and the padding in front of it
+/// begins behind the last place's end, so no other place lies in it. The
+/// reads of a level are all recorded before its writes, as they were, and in
+/// the same order.
+fn reads_join() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_STEPS_READS_JOIN"))
+}
+
+/// Since the last frame-rate line, with [`reads_join`]: the reads of the
+/// places, and the copy commands they went in.
+static READS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The padding between two places in the buffer between is less than this.
+const PLACE: u64 = 256;
+
+/// `reads` (source, offset in it, offset in the buffer between, bytes; in
+/// the order the places were given out) with each read that continues the
+/// one before made one with it ([`reads_join`]): the same source (`same`),
+/// behind the last one's end by less than [`PLACE`], and as far behind it in
+/// the buffer between.
+fn join_reads<T>(reads: &mut Vec<(T, u64, u64, u64)>, same: impl Fn(&T, &T) -> bool) {
+    let mut kept = 0;
+    for i in 1..reads.len() {
+        let (last, next) = (&reads[kept], &reads[i]);
+        let (source_end, between_end) = (last.1 + last.3, last.2 + last.3);
+        let continues = same(&last.0, &next.0)
+            && next.1 >= source_end
+            && next.1 - source_end < PLACE
+            && next.2 >= between_end
+            && next.2 - between_end == next.1 - source_end;
+        if continues {
+            let to = next.1 + next.3;
+            reads[kept].3 = to - reads[kept].1;
+        } else {
+            kept += 1;
+            reads.swap(kept, i);
+        }
+    }
+    reads.truncate((kept + 1).min(reads.len()));
 }
 
 /// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
@@ -709,6 +867,9 @@ impl Host {
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
+        // ([`holder_index`]: by the stretch between the writers' ends, until
+        // a copy done here adds a writer.)
+        let mut holders = holder_index().then(|| Holders::of(&writers));
         let mut room = HashMap::default();
         let mut end = 0u64;
         for &(i, level) in &chosen {
@@ -724,7 +885,10 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = match holders.as_mut() {
+                        Some(holders) => holders.holder(&writers, src, src + len)?,
+                        None => holder(&writers, src, src + len)?,
+                    };
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -763,11 +927,12 @@ impl Host {
                         copy: true,
                     });
                     held.clear();
+                    holders = None;
                     To::Copy(to, dst)
                 }
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                    Some(FillTo::Buffer(buffer, offset)) => To::Buffer(buffer, offset),
                     None => continue,
                 },
             };
@@ -823,9 +988,15 @@ impl Host {
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                    To::Buffer(buffer, offset) => writes.push((buffer, *offset, op.at, len)),
                     To::Slot(..) => {}
                 }
+            }
+            if reads_join() {
+                let all = reads.len();
+                join_reads(&mut reads, |a, b| a.as_raw() == b.as_raw());
+                READS[0].fetch_add(all as u64, Ordering::Relaxed);
+                READS[1].fetch_add(reads.len() as u64, Ordering::Relaxed);
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
@@ -890,7 +1061,7 @@ fn noted(ops: &[Op]) {
     for op in ops {
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
-            To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
+            To::Slot(..) | To::Buffer(..) => ((0, 0), 0),
         };
         let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
         *e = (e.0 + 1, op.from.1, dst);
@@ -912,6 +1083,12 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    if reads_join() {
+        let [all, commands] = [0, 1].map(|i| READS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "reads of steps done on the card that lie beside each other go as one copy (VICTORY_STEPS_READS_JOIN=1), per frame:              {all:.0} places read in {commands:.0} copy commands"
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1162,6 +1339,155 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// `VICTORY_STEPS_HOLDER_INDEX`: every place within a stretch between two
+    /// neighbouring ends of the writers' ranges is met by the same writers,
+    /// and they say the same of it as of any other place there; a place
+    /// across an end lies within no stretch. Random ranges (empty ones and
+    /// nested ones among them), three host copies and writers through none.
+    #[test]
+    fn places_of_a_stretch_hear_the_same_of_the_writers() {
+        let mut seed = 0x51ed_2701_u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        let copies = [1u32, 2, 3];
+        let mut within = 0;
+        for _ in 0..2000 {
+            let writers: Vec<(Option<&u32>, usize, usize)> = (0..next(12))
+                .map(|_| {
+                    let from = next(200);
+                    let several = next(3) == 0;
+                    let who = match next(8) {
+                        0 => None,
+                        n => Some(&copies[if several { n % 3 } else { 0 }]),
+                    };
+                    let most = if next(4) == 0 { 200 } else { 30 };
+                    (who, from, from + next(most))
+                })
+                .collect();
+            let stretches = Stretches::of(writers.iter().map(|w| (w.1, w.2)));
+            let said = |from: usize, to: usize| found_in(writers.iter().copied(), |a, b| a == b, from, to);
+            let meeting = |from: usize, to: usize| -> Vec<usize> {
+                (0..writers.len()).filter(|&i| meet((writers[i].1, writers[i].2), (from, to))).collect()
+            };
+            for _ in 0..40 {
+                let from = next(420);
+                let to = from + next(40);
+                match stretches.within(from, to) {
+                    Some(k) => {
+                        within += 1;
+                        let (a, b) = (stretches.0[k], stretches.0[k + 1]);
+                        assert!(a <= from && to <= b && from < to);
+                        // The whole stretch, and its first byte: the same writers, the same answer.
+                        assert_eq!(meeting(from, to), meeting(a, b), "{writers:?} {from}..{to}");
+                        assert_eq!(meeting(from, to), meeting(a, a + 1));
+                        assert_eq!(said(from, to), said(a, b));
+                        assert_eq!(said(from, to), said(a, a + 1));
+                    }
+                    None => {
+                        // Nothing to read, outside every end, or an end inside it.
+                        let ends = &stretches.0;
+                        let outside = ends.first().is_none_or(|&e| from < e) || ends.last().is_none_or(|&e| to > e);
+                        assert!(from >= to || outside || ends.iter().any(|&e| from < e && e < to), "{ends:?} {from}..{to}");
+                    }
+                }
+            }
+        }
+        assert!(within > 1000, "{within}");
+    }
+
+    /// `VICTORY_STEPS_READS_JOIN`: reads one behind the other in the source
+    /// and in the buffer between alike are one; the others stay as they are,
+    /// in order.
+    #[test]
+    fn reads_beside_each_other_are_one_copy() {
+        let join = |mut reads: Vec<(u8, u64, u64, u64)>| {
+            join_reads(&mut reads, |a, b| a == b);
+            reads
+        };
+        assert_eq!(join(vec![]), []);
+        assert_eq!(join(vec![(1, 0x1000, 0, 0x1e0)]), [(1, 0x1000, 0, 0x1e0)]);
+        // Three of the ring's places, 0x200 apart as ours are: one read, to the last one's end.
+        let ring = vec![(1, 0x1000, 0, 0x1e0), (1, 0x1200, 0x200, 0x1e0), (1, 0x1400, 0x400, 0x160)];
+        assert_eq!(join(ring), [(1, 0x1000, 0, 0x560)]);
+        // Nothing between them at all.
+        assert_eq!(join(vec![(1, 0, 0, 0x100), (1, 0x100, 0x100, 0x100)]), [(1, 0, 0, 0x200)]);
+        // Another source; another distance in the source than in the buffer between (the
+        // title's places 0x1e0 apart, ours 0x200); a place ahead of the last; one a
+        // whole place or more behind it.
+        let apart = vec![
+            (1, 0x1000, 0, 0x1e0),
+            (2, 0x1200, 0x200, 0x1e0),
+            (2, 0x13e0, 0x400, 0x1e0),
+            (2, 0x1000, 0x600, 0x10),
+            (2, 0x1110, 0x700, 0x10),
+        ];
+        assert_eq!(join(apart.clone()), apart);
+        // Joined runs with one that stays between them, in order.
+        let mixed = vec![
+            (1, 0x100, 0, 0x10),
+            (1, 0x200, 0x100, 0xc0),
+            (1, 0x300, 0x200, 0x100),
+            (2, 0x300, 0x300, 0x100),
+            (1, 0x400, 0x400, 0x20),
+            (1, 0x500, 0x500, 0x20),
+        ];
+        assert_eq!(join(mixed), [(1, 0x100, 0, 0x300), (2, 0x300, 0x300, 0x100), (1, 0x400, 0x400, 0x120)]);
+        // Every byte asked for is in what is read, at the same distance from its place.
+        let mut seed = 7u64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..500 {
+            let (mut src, mut at) = (0x1000u64, 0u64);
+            let mut reads = Vec::new();
+            for _ in 0..next(30) {
+                let len = 16 * (1 + next(40));
+                let source = if next(6) == 0 { 2u8 } else { 1 };
+                reads.push((source, src, at, len));
+                at = (at + len).next_multiple_of(PLACE);
+                src = match next(4) {
+                    0 => src + len + 16 * next(64),
+                    1 => 0x1000 + 16 * next(4096),
+                    _ => (src + len).next_multiple_of(PLACE),
+                };
+            }
+            let joined = join(reads.clone());
+            assert!(joined.len() <= reads.len());
+            for (source, src, at, len) in reads {
+                let holds = |j: &&(u8, u64, u64, u64)| j.0 == source && j.1 <= src && src + len <= j.1 + j.3 && src - j.1 == at.wrapping_sub(j.2);
+                assert_eq!(joined.iter().filter(holds).count(), 1);
+            }
+            // What is read lies apart in the buffer between.
+            for pair in joined.windows(2) {
+                assert!(pair[0].2 + pair[0].3 <= pair[1].2);
+            }
+        }
+    }
+
+    /// What the writers say: nothing where none meets, the one host copy
+    /// they write through, and why not otherwise, by the first that tells.
+    #[test]
+    fn the_writers_that_meet_a_place_name_its_host_copy() {
+        let (a, b) = (1u32, 2u32);
+        let writers = [(Some(&a), 100, 200), (Some(&a), 150, 300), (Some(&b), 280, 400), (None, 390, 500)];
+        let said = |from, to| found_in(writers.iter().copied(), |x, y| x == y, from, to);
+        assert_eq!(said(0, 100), Ok(None));
+        assert_eq!(said(100, 280), Ok(Some(&a)));
+        assert_eq!(said(300, 390), Ok(Some(&b)));
+        assert_eq!(said(279, 281), Err("flights write it through two host copies"));
+        assert_eq!(said(399, 600), Err("a read-back or a value behind a flight is written there"));
+        assert_eq!(said(250, 600), Err("flights write it through two host copies"));
+        // The index refuses through the same path as the plain look.
+        let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
+        let mut holders = Holders::of(&writers);
+        assert!(holders.holder(&writers, 104, 106).is_err());
+        assert!(holders.holder(&writers, 104, 120).is_err());
+        assert_eq!(holders.said.len(), 1);
     }
 
     /// Reads are all before writes, between two buffers and within one, and

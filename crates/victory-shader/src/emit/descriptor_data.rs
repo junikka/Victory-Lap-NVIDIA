@@ -128,7 +128,8 @@ impl<'a> Lower<'a> {
                             .is_some_and(|p| {
                                 self.halves_only.contains(&p)
                                     && (un.contains("_format_d16_")
-                                        || self.format_load_read_as_halves(ui))
+                                        || (super::half_loads_on()
+                                            && self.format_load_read_as_halves(ui)))
                             });
                         (10 | u, if halves { 0x405 } else { 0x409 })
                     } else if !counted

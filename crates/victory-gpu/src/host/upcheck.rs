@@ -29,6 +29,11 @@ use super::*;
 use crate::shadow::Shadow;
 
 pub(crate) fn on() -> bool {
+    // (Or asked for with the two stages of a submission, `pipe`.)
+    asked() || pipe::checked()
+}
+
+fn asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPCOPY_CHECK").is_some_and(|v| v == "1"))
 }
@@ -150,13 +155,14 @@ struct Stale {
 
 static STALE: Mutex<BTreeMap<(u64, u64), Stale>> = Mutex::new(BTreeMap::new());
 
-/// Records the looks at what `dirty` sends up into `list`, ahead of the
-/// sends.
-pub(super) fn record(
-    host: &Host,
-    list: &ID3D12GraphicsCommandList,
-    dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
-) -> Option<Looks> {
+/// What the refreshes told of the copies a submission sends up, taken with
+/// what it sends ([`take_noted`]); and their bytes, both sides.
+pub(super) struct Noted(Vec<(std::sync::Arc<Shadow>, Taken)>, usize);
+
+/// Takes what the refreshes since the last send told of `dirty`, which a
+/// submission sends up: when the ranges are taken, so that what a later
+/// submission's refreshes tell is that one's.
+pub(super) fn take_noted(dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Noted {
     let mut noted = std::mem::take(&mut *NOTED.lock().unwrap_or_else(|e| e.into_inner()));
     let mut all: Vec<(std::sync::Arc<Shadow>, Taken)> = Vec::new();
     let mut total = 0;
@@ -168,6 +174,13 @@ pub(super) fn record(
             }
         }
     }
+    Noted(all, total)
+}
+
+/// Records the looks at what a submission sends up into `list`, ahead of
+/// the sends: `noted` is what the refreshes told of it.
+pub(super) fn record_noted(host: &Host, list: &ID3D12GraphicsCommandList, noted: Noted) -> Option<Looks> {
+    let Noted(all, total) = noted;
     if all.is_empty() {
         return None;
     }
@@ -1184,6 +1197,167 @@ mod tests {
         assert_eq!([holds[D], holds[D + 64], holds[D + 128], holds[D + 192], holds[S]], [2, 7, 0, 5, 9], "the card");
         assert_eq!(look(host), Some(0));
         // With the debug layer.
+        if let Some(said) = host.log_messages() {
+            eprintln!("{said}");
+        }
+    }
+
+    /// The two stages of a submission (`pipe`, `VICTORY_SUBMIT_PIPELINE=1`;
+    /// the same is asked without it, the looks at the line left out): a
+    /// submission whose shader writes a declared range is handed over and,
+    /// while nothing of it is on the queue, the title writes another byte of
+    /// the same page and the next submission, which refreshes the page, is
+    /// prepared. The first is in the air for it: the title's byte goes up
+    /// beside what the shader writes, and both stand in the end, on the card
+    /// and in title memory.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1, with and without VICTORY_SUBMIT_PIPELINE=1, and a process of its own"]
+    fn a_submission_handed_over_is_in_the_air_before_it_is_sent() {
+        /// For the thread that prepares the next submission.
+        struct Across<'a>(&'a Host, &'a HostList);
+        // SAFETY: the host is shared between threads as it is; the list is
+        // closed, and the other thread alone has it meanwhile.
+        unsafe impl Send for Across<'_> {}
+        let Some(host) = host() else {
+            return;
+        };
+        let (title, start, shadow) = title(0xa151, false);
+        let piped = pipe::on();
+        const WRITTEN: usize = 4096;
+        const RESULT: usize = WRITTEN + 512;
+        const BESIDE: usize = WRITTEN + 3000;
+        let all = host.new_list().unwrap();
+        shadow.refresh(&all, start as u64, LEN as u64);
+        all.close();
+        host.execute_own(&all);
+        settle_now(WHY_SYNC);
+        let mut lists = vec![all];
+        let mut held = 0;
+        for round in 0..8u8 {
+            let result = [0x80 | round; 256];
+            let a = host.new_list().unwrap();
+            shadow.refresh(&a, start as u64, LEN as u64);
+            shadow.gpu_writes(&a, (start + WRITTEN) as u64, 4096);
+            write(host, &a, &shadow, RESULT, &result);
+            a.close();
+            // The second stage stands until the next submission is on its way.
+            let hold = piped.then(|| pipe::HOLD.lock().unwrap_or_else(|e| e.into_inner()));
+            let number = host.execute_own(&a);
+            if piped {
+                // Handed over: in the air, and nothing of it on the queue.
+                let line = crate::host::line();
+                let flight = line
+                    .line
+                    .iter()
+                    .find_map(|l| match l {
+                        Late::Run(f) if f.number == number => Some(f),
+                        _ => None,
+                    })
+                    .expect("the flight is in the line from its hand-over");
+                assert!(!flight.sent && flight.card.is_none(), "round {round}: nothing of it is on the queue");
+                assert!(touches(&line.written, start + RESULT, start + RESULT + 256), "round {round}: what it may write is in the air");
+                assert!(line.target < flight.fence, "round {round}: no value of the fence is behind it");
+                // SAFETY: a plain query.
+                assert!(unsafe { host.fence.GetCompletedValue() } < flight.fence);
+                drop(line);
+                assert!(flying() && shadow.writes_pending());
+                assert!(FINISHED.load(Ordering::Acquire) < number, "round {round}: it has not landed");
+                held += 1;
+            }
+            // The title writes beside what the shader writes; the next
+            // submission refreshes the page and reads both.
+            title[BESIDE] = round + 1;
+            let b = host.new_list().unwrap();
+            shadow.refresh(&b, start as u64, LEN as u64);
+            b.close();
+            std::thread::scope(|scope| {
+                let across = Across(host, &b);
+                let next = scope.spawn(move || {
+                    let across = across;
+                    across.0.execute_own(across.1);
+                });
+                // Its first stage runs beside the held second stage of the
+                // one before, up to where it takes its ranges.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(hold);
+                next.join().unwrap();
+            });
+            settle_now(WHY_SYNC);
+            assert_eq!(title[RESULT..RESULT + 256], result, "round {round}: what the shader wrote is in title memory");
+            assert_eq!(title[BESIDE], round + 1);
+            let holds = card(host, &shadow);
+            assert_eq!(holds[RESULT..RESULT + 256], result, "round {round}: what the shader wrote stands on the card");
+            assert_eq!(holds[BESIDE], round + 1, "round {round}: the title's byte beside it is on the card");
+            assert_eq!(look(host), Some(0), "round {round}: the card's side is the CPU's side");
+            lists.extend([a, b]);
+        }
+        eprintln!("the two stages: {piped}; flights looked at while handed over and not sent: {held}");
+        assert_eq!(held, if piped { 8 } else { 0 });
+        // With the debug layer.
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// A queue's submission as the play set sends it (ticket 153): its
+    /// lists taken from the title's ([`crate::list::Detached`]) and parts of
+    /// submissions joined in one (`VICTORY_JOIN_PARTS`), through
+    /// [`Host::execute_parts`] and `send_late`, which no other test reaches
+    /// (the flight tests above send lists of ours, `execute_own`). Each round
+    /// sends three parts in one: a shader writes a declared range, the title
+    /// has written a byte beside it, and the parts behind refresh the page
+    /// and write again. In the end both stand, on the card and in title
+    /// memory, with and without the two stages (`VICTORY_SUBMIT_PIPELINE=1`).
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 (the play set: VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_LATE_WAIT=3), with and without VICTORY_SUBMIT_PIPELINE=1, and a process of its own"]
+    fn a_queues_submission_in_parts_is_sent_late_and_lands() {
+        use crate::list::Detached;
+        let Some(host) = host() else {
+            return;
+        };
+        let (title, start, shadow) = title(0xa153, false);
+        const WRITTEN: usize = 4096;
+        const RESULT: usize = WRITTEN + 512;
+        const SECOND: usize = WRITTEN + 1024;
+        const BESIDE: usize = WRITTEN + 3000;
+        let all = host.new_list().unwrap();
+        shadow.refresh(&all, start as u64, LEN as u64);
+        all.close();
+        host.execute_own(&all);
+        settle_now(WHY_SYNC);
+        let sent = LATE_STATS[0].load(Ordering::Relaxed);
+        for round in 0..8u8 {
+            let result = [0x80 | round; 256];
+            let second = [0x40 | round; 128];
+            title[BESIDE] = round + 1;
+            let a = host.new_list().unwrap();
+            shadow.refresh(&a, start as u64, LEN as u64);
+            shadow.gpu_writes(&a, (start + WRITTEN) as u64, 4096);
+            write(host, &a, &shadow, RESULT, &result);
+            a.close();
+            let b = host.new_list().unwrap();
+            shadow.refresh(&b, start as u64, LEN as u64);
+            b.close();
+            let c = host.new_list().unwrap();
+            shadow.gpu_writes(&c, (start + WRITTEN) as u64, 4096);
+            write(host, &c, &shadow, SECOND, &second);
+            c.close();
+            let before = LATE_STATS[0].load(Ordering::Relaxed);
+            host.execute_parts(vec![Detached::ours(a), Detached::ours(b), Detached::ours(c)], vec![0, 1, 2], &[1, 2]);
+            assert!(LATE_STATS[0].load(Ordering::Relaxed) > before, "round {round}: sent as a flight (send_late)");
+            settle_now(WHY_SYNC);
+            assert_eq!(title[RESULT..RESULT + 256], result, "round {round}: what the first part wrote is in title memory");
+            assert_eq!(title[SECOND..SECOND + 128], second, "round {round}: what the last part wrote is in title memory");
+            assert_eq!(title[BESIDE], round + 1, "round {round}: the title's byte stays");
+            let holds = card(host, &shadow);
+            assert_eq!(holds[RESULT..RESULT + 256], result, "round {round}: the first part's write stands on the card");
+            assert_eq!(holds[SECOND..SECOND + 128], second, "round {round}: the last part's write stands on the card");
+            assert_eq!(holds[BESIDE], round + 1, "round {round}: the title's byte beside it is on the card");
+            assert_eq!(look(host), Some(0), "round {round}: the card's side is the CPU's side");
+        }
+        eprintln!(
+            "parts sent late: {} flights for 8 submissions; the two stages: {}",
+            LATE_STATS[0].load(Ordering::Relaxed) - sent,
+            pipe::on()
+        );
         if let Some(said) = host.log_messages() {
             eprintln!("{said}");
         }

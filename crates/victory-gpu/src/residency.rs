@@ -136,6 +136,94 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     }
 }
 
+/// Whether the idle texture sweep keeps what it lets go under PC memory
+/// pressure in bounds, and pressure has a way out (`VICTORY_PRESSURE_KEEP=1`,
+/// off: ticket 124). Unset, under pressure every idle host copy of a
+/// texture the title fills goes after 5 s, all of them at one look, and
+/// pressure clears above 5 GiB free and 6 GiB of commit: in session notwin
+/// it tripped at 3,025 MiB free and never cleared, 190,767 textures went
+/// and 31 % of them were made again, while private bytes came back to
+/// where they were within 3.5 minutes. On,
+/// - a texture goes after [`PRESSURE_KEEP_MS`] idle at least, its back-off
+///   ([`backed_off`]) more, the longest idle first, [`PRESSURE_MOST`] at
+///   most at a look (`crate::resource::let_go_idle`);
+/// - only what gives memory back goes: the textures of pool blocks that
+///   come back whole, and those with a staging buffer of their own; spare
+///   staging blocks and snapshot buffers go before them, all of them;
+/// - pressure ends at [`way_out`].
+pub(crate) fn pressure_keep() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PRESSURE_KEEP"))
+}
+
+/// Under pressure with [`pressure_keep`]: the least a texture is idle
+/// before it goes, ms.
+pub(crate) const PRESSURE_KEEP_MS: u64 = 30_000;
+/// The most a texture is kept by its back-off ([`backed_off`]), ms.
+const PRESSURE_KEEP_LONGEST_MS: u64 = 600_000;
+/// The bytes of textures let go at one look, at most.
+pub(crate) const PRESSURE_MOST: u64 = 128 << 20;
+/// A texture made again within this many ms of its let-go was let go too
+/// soon ([`made_again_soon`]).
+const AGAIN_WITHIN_MS: u64 = 60_000;
+
+/// How long a texture with back-off `keep_ms` (0: none yet) must be idle to
+/// go under pressure: [`PRESSURE_KEEP_MS`] to [`PRESSURE_KEEP_LONGEST_MS`].
+pub(crate) fn pressure_idle_ms(keep_ms: u32) -> u64 {
+    u64::from(keep_ms).clamp(PRESSURE_KEEP_MS, PRESSURE_KEEP_LONGEST_MS)
+}
+
+/// Whether a texture made again `since_ms` after its let-go was let go too
+/// soon.
+pub(crate) fn made_again_soon(since_ms: u64) -> bool {
+    since_ms < AGAIN_WITHIN_MS
+}
+
+/// A texture's back-off once it is made again `since_ms` after its let-go:
+/// twice its keep ([`pressure_idle_ms`]) if that was too soon
+/// ([`made_again_soon`]), up to [`PRESSURE_KEEP_LONGEST_MS`]; else as it was.
+pub(crate) fn backed_off(keep_ms: u32, since_ms: u64) -> u32 {
+    if !made_again_soon(since_ms) {
+        return keep_ms;
+    }
+    // (At most ten minutes: fits.)
+    (pressure_idle_ms(keep_ms) * 2).min(PRESSURE_KEEP_LONGEST_MS) as u32
+}
+
+/// Where pressure entered at free RAM and commit `entry` ends, with
+/// [`pressure_keep`]: at 4 GiB free or 1 GiB above the free RAM at entry,
+/// whichever is lower; the commit line likewise, at 5 GiB or 1 GiB above
+/// the commit at entry. (Today's 5 and 6 GiB are not reached on a PC of
+/// 32 GB whose other programs hold 7.4 of it.)
+fn way_out(entry: [u64; 2]) -> [u64; 2] {
+    let [physical, commit] = entry;
+    [(4 * GIB).min(physical.saturating_add(GIB)), (5 * GIB).min(commit.saturating_add(GIB))]
+}
+
+/// [`next_pressure`] with [`pressure_keep`]: in as there, out at
+/// [`way_out`] of `entry`.
+fn next_pressure_kept(was: bool, physical: u64, commit: u64, entry: [u64; 2]) -> bool {
+    if was {
+        let [physical_out, commit_out] = way_out(entry);
+        physical < physical_out || commit < commit_out
+    } else {
+        next_pressure(false, physical, commit)
+    }
+}
+
+/// Free RAM and commit when pressure last began ([`next_pressure_kept`]).
+static ENTRY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// When pressure last began (`crate::host::coarse_ms`), and the ms under
+/// pressure before it.
+static PRESSURED_SINCE: AtomicU64 = AtomicU64::new(0);
+static PRESSURED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Seconds under pressure since the start, by the ms under it before and
+/// since `since` (`None`: not under it now) until `now`.
+fn pressured_secs(before_ms: u64, since: Option<u64>, now: u64) -> u64 {
+    (before_ms + since.map_or(0, |since| now.saturating_sub(since))) / 1000
+}
+
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
     if !on() {
@@ -145,8 +233,21 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let entry = ENTRY.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let pressure = if pressure_keep() {
+        next_pressure_kept(was, physical, commit, entry)
+    } else {
+        next_pressure(was, physical, commit)
+    };
     if pressure != was {
+        let now = crate::host::coarse_ms();
+        if pressure {
+            ENTRY[0].store(physical, Ordering::Relaxed);
+            ENTRY[1].store(commit, Ordering::Relaxed);
+            PRESSURED_SINCE.store(now, Ordering::Relaxed);
+        } else {
+            PRESSURED_MS.fetch_add(now.saturating_sub(PRESSURED_SINCE.load(Ordering::Relaxed)), Ordering::Relaxed);
+        }
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
             tracing::warn!(
@@ -230,6 +331,13 @@ pub(crate) struct Totals {
     /// the card's room.
     pub(crate) refused: u64,
     pub(crate) ram_refused: u64,
+    /// Textures made again within a minute of their let-go
+    /// ([`made_again_soon`]), and their bytes.
+    pub(crate) again_soon: u64,
+    pub(crate) again_soon_bytes: u64,
+    /// The bytes of pool blocks given back (textures' and staging's).
+    pub(crate) given_back_bytes: u64,
+    pub(crate) pressured_secs: u64,
 }
 
 impl Totals {
@@ -243,6 +351,14 @@ impl Totals {
             upload_bytes: c(Churn::UploadBytes),
             refused: crate::draw::HEAP_TEXTURES_FULL.load(Ordering::Relaxed),
             ram_refused: c(Churn::RamRefused),
+            again_soon: crate::resource::AGAIN_SOON[0].load(Ordering::Relaxed),
+            again_soon_bytes: crate::resource::AGAIN_SOON[1].load(Ordering::Relaxed),
+            given_back_bytes: crate::pool::given_back_bytes(),
+            pressured_secs: pressured_secs(
+                PRESSURED_MS.load(Ordering::Relaxed),
+                pressured().then(|| PRESSURED_SINCE.load(Ordering::Relaxed)),
+                crate::host::coarse_ms(),
+            ),
         }
     }
 }
@@ -278,7 +394,8 @@ fn line(now: &Totals, before: &Totals, secs: f64, waiting: u64, guard: &str, car
     let card = card.map_or("unknown".to_owned(), |[used, budget]| format!("{}/{} MB", used >> 20, budget >> 20));
     format!(
         "residency: let go idle {} budget {} unmap {}, made again {}, upload {:.1} MB/s ({} MB so far), index waiting {waiting}, \
-         refused passes {} (ram guard {}), guard {guard}, card {card} (counts since the start)",
+         refused passes {} (ram guard {}), guard {guard}, card {card}, made again within 60 s {} ({} MB), \
+         blocks given back {} MB, under pressure {} s (counts since the start)",
         now.idle,
         now.budget,
         now.unmap,
@@ -287,6 +404,10 @@ fn line(now: &Totals, before: &Totals, secs: f64, waiting: u64, guard: &str, car
         now.upload_bytes >> 20,
         now.refused,
         now.ram_refused,
+        now.again_soon,
+        now.again_soon_bytes >> 20,
+        now.given_back_bytes >> 20,
+        now.pressured_secs,
     )
 }
 
@@ -301,12 +422,16 @@ pub(crate) fn log_line(card: Option<[u64; 4]>) {
     let waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
     let used_budget = card.map(|[budget, used, ..]| [used, budget]);
     tracing::info!("{}{}", line(&now, &before, secs, waiting, guard, used_budget), crate::priority::tail(card));
+    if let Some(why) = crate::waitwhy::line() {
+        tracing::info!("{why}");
+    }
     static PLACEMENT: std::sync::Once = std::sync::Once::new();
     PLACEMENT.call_once(|| tracing::info!("{}", crate::pool::placement_line(crate::pool::small_placement())));
     let fill = crate::pool::account();
     tracing::info!("{}", crate::pool::fill_line(&fill));
     tracing::info!("{}", crate::pool::pack_line(crate::pool::pack(), &fill, crate::pool::emptying()));
     tracing::info!("{}", crate::resource::budget_line(card));
+    tracing::info!("{}", crate::shadow::reserve_line(card, now.budget));
     let [renders, twins] = crate::resource::card_textures();
     tracing::info!("{}", card_account_line(card.map(|memory| memory[1]), fill.block_bytes, renders, crate::shadow::live_span_bytes(), twins));
 }
@@ -357,13 +482,26 @@ mod tests {
 
     #[test]
     fn line_holds_every_count_in_the_parsed_order() {
-        let now = Totals { idle: 7, budget: 3, unmap: 2, made_again: 5, upload_bytes: 50 << 20, refused: 4, ram_refused: 1 };
+        let now = Totals {
+            idle: 7,
+            budget: 3,
+            unmap: 2,
+            made_again: 5,
+            upload_bytes: 50 << 20,
+            refused: 4,
+            ram_refused: 1,
+            again_soon: 6,
+            again_soon_bytes: 12 << 20,
+            given_back_bytes: 128 << 20,
+            pressured_secs: 42,
+        };
         let before = Totals { upload_bytes: 0, ..now };
         let l = line(&now, &before, 5.0, 9, "calm", Some([6038 << 20, 9285 << 20]));
         assert_eq!(
             l,
             "residency: let go idle 7 budget 3 unmap 2, made again 5, upload 10.5 MB/s (50 MB so far), index waiting 9, \
-             refused passes 4 (ram guard 1), guard calm, card 6038/9285 MB (counts since the start)"
+             refused passes 4 (ram guard 1), guard calm, card 6038/9285 MB, made again within 60 s 6 (12 MB), \
+             blocks given back 128 MB, under pressure 42 s (counts since the start)"
         );
         assert!(line(&now, &before, 0.0, 0, "calm", None).contains("upload 0.0 MB/s (50 MB so far)"));
         assert!(line(&now, &before, 0.0, 0, "calm", None).contains("card unknown"));
@@ -408,6 +546,59 @@ mod tests {
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
         assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+    }
+
+    #[test]
+    fn pressure_kept_ends_at_4_gib_or_1_gib_above_entry() {
+        // Session notwin: in at 3,025 MiB free, never out at 5 GiB; now out
+        // at 4,049 MiB.
+        let notwin = [3025 * MIB, 20 * GIB];
+        assert_eq!(way_out(notwin), [4049 * MIB, 5 * GIB]);
+        assert!(next_pressure_kept(true, 4049 * MIB - 1, 20 * GIB, notwin));
+        assert!(!next_pressure_kept(true, 4049 * MIB, 20 * GIB, notwin));
+        // Entered at 3.5 GiB (by commit): out at 4 GiB, not 4.5.
+        let entry = [3584 * MIB, 20 * GIB];
+        assert_eq!(way_out(entry), [4 * GIB, 5 * GIB]);
+        assert!(next_pressure_kept(true, 4 * GIB - 1, 20 * GIB, entry));
+        assert!(!next_pressure_kept(true, 4 * GIB, 20 * GIB, entry));
+        assert!(next_pressure(true, 4 * GIB, 20 * GIB));
+        // Entered lower: 1 GiB above it is enough.
+        let low = [2 * GIB, 3 * GIB];
+        assert_eq!(way_out(low), [3 * GIB, 4 * GIB]);
+        assert!(!next_pressure_kept(true, 3 * GIB, 4 * GIB, low));
+        assert!(next_pressure_kept(true, 3 * GIB, 4 * GIB - 1, low));
+        assert!(next_pressure_kept(true, 3 * GIB - 1, 4 * GIB, low));
+        // In as before.
+        for (physical, commit) in [(3 * GIB, 16 * GIB), (12 * GIB, 4 * GIB), (4 * GIB, 5 * GIB)] {
+            assert_eq!(next_pressure_kept(false, physical, commit, entry), next_pressure(false, physical, commit));
+        }
+    }
+
+    #[test]
+    fn pressure_keep_is_30_s_at_least_and_backs_off_to_10_minutes() {
+        assert_eq!(pressure_idle_ms(0), 30_000);
+        assert_eq!(pressure_idle_ms(120_000), 120_000);
+        assert_eq!(pressure_idle_ms(u32::MAX), 600_000);
+        // Made again within a minute: twice as long each time, up to ten minutes.
+        let mut keep = 0;
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            keep = backed_off(keep, 59_999);
+            seen.push(keep);
+        }
+        assert_eq!(seen, [60_000, 120_000, 240_000, 480_000, 600_000, 600_000, 600_000]);
+        // Made again later: as it was.
+        assert_eq!(backed_off(0, 60_000), 0);
+        assert_eq!(backed_off(240_000, 3_600_000), 240_000);
+        assert!(made_again_soon(0) && !made_again_soon(60_000));
+    }
+
+    #[test]
+    fn seconds_under_pressure_count_the_spell_now() {
+        assert_eq!(pressured_secs(0, None, 10_000), 0);
+        assert_eq!(pressured_secs(5_500, None, 10_000), 5);
+        assert_eq!(pressured_secs(5_500, Some(7_000), 10_000), 8);
+        assert_eq!(pressured_secs(0, Some(12_000), 10_000), 0);
     }
 
     #[test]

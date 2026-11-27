@@ -1403,6 +1403,51 @@ fn f16_nearest_on() -> bool {
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`half_views_on`], for its thread only.
+    pub(super) static TEST_HALF_VIEWS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`half_loads_on`], for its thread only.
+    pub(super) static TEST_HALF_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_HALF_VIEWS=0`: halves moved through a 16-bit table view (the
+/// d16 accesses `buffer_load/store_format_d16_*`, and the format loads read
+/// only as halves) go by way of 32-bit floats as before the half views, and
+/// no view is named in [`super::HostShader::half_views`]; it also turns off
+/// [`half_loads_on`], which needs the views. On by default (unset: as now).
+/// After kitty 046f8d029 / 07e9fbe5d (from PastiiJay/klbf-lab PR #113):
+/// their runs on NVIDIA had stair-stepped sun-shadow edges and blocky face
+/// tiles with the 16-bit path, gone with both off. Part of the shader cache
+/// key when off (victory-gpu `shader_cache`).
+pub fn half_views_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HALF_VIEWS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch_not_zero(std::env::var_os("VICTORY_HALF_VIEWS").as_deref()))
+}
+
+/// `VICTORY_HALF_LOADS=0` (kitty's `K6_HALF_LOADS=0`): a format load of
+/// whole dwords whose result is read only as halves loads floats as before,
+/// instead of the 16-bit integers through a half view
+/// ([`Lower::format_load_read_as_halves`]); d16 accesses keep their views.
+/// On by default; off whenever [`half_views_on`] is. Part of the shader
+/// cache key when off.
+pub fn half_loads_on() -> bool {
+    if !half_views_on() {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(on) = TEST_HALF_LOADS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch_not_zero(std::env::var_os("VICTORY_HALF_LOADS").as_deref()))
+}
+
+/// On unless the switch is exactly `0`. Pure, for testing.
+fn switch_not_zero(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -2784,7 +2829,10 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
-        self.halves_only = self.places_read_as_halves();
+        // (`VICTORY_HALF_VIEWS=0`: none, every access by way of floats.)
+        if half_views_on() {
+            self.halves_only = self.places_read_as_halves();
+        }
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -12354,7 +12402,7 @@ impl<'a> Lower<'a> {
         // Where this does not apply, a d16 access of an integer view still
         // keeps the low 16 bits ([`Self::integer_view`]).
         let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
-            self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst))
+            self.halves_only.contains(p) && (d16 || (half_loads_on() && self.format_load_read_as_halves(inst)))
         });
         let halves = place.is_some();
         if let Some(place) = place {
@@ -13516,6 +13564,16 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn half_switches_stay_on_unless_exactly_zero() {
+        use std::ffi::OsStr;
+        assert!(super::switch_not_zero(None));
+        assert!(!super::switch_not_zero(Some(OsStr::new("0"))));
+        for value in ["", "1", "other"] {
+            assert!(super::switch_not_zero(Some(OsStr::new(value))));
+        }
+    }
 
     #[test]
     fn shifted_thread_ids_are_uniform_only_when_every_lane_agrees() {

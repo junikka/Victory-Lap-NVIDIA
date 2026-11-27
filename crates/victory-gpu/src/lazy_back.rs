@@ -65,7 +65,7 @@ pub(crate) fn enabled() -> bool {
         if !std::env::var("VICTORY_LAZY_BACK").is_ok_and(|v| v.trim() == "1") {
             return false;
         }
-        let can = crate::shadow::relay() && crate::land::on() && crate::land::beside_on();
+        let can = can();
         if !can {
             tracing::warn!(
                 "VICTORY_LAZY_BACK=1 is left off: it needs VICTORY_RELAY, VICTORY_LAND and VICTORY_LAND_BESIDE as they are by default"
@@ -73,6 +73,18 @@ pub(crate) fn enabled() -> bool {
         }
         can
     })
+}
+
+/// Whether what this rests on is as by default: flights landed on their
+/// own thread, merged in one pass, through our own view.
+pub(crate) fn can() -> bool {
+    crate::shadow::relay() && crate::land::on() && crate::land::beside_on()
+}
+
+/// Whether pieces are held here at all: with [`enabled`], or for the
+/// pieces `VICTORY_SKIP_WC_BACK` would leave (`crate::census::hold`).
+pub(crate) fn on() -> bool {
+    enabled() || crate::census::hold()
 }
 
 /// Frames with a fault after which a block is hot
@@ -115,6 +127,9 @@ struct Held {
     landing: bool,
     /// To be landed at the next [`tend`].
     wanted: bool,
+    /// Held to sample the title's reads (`crate::byuse`), not for the
+    /// switch: landed at the first [`tend`] of a later frame.
+    sampled: bool,
 }
 
 /// How often the title touched a block that was held (jman's hot blocks).
@@ -199,7 +214,7 @@ pub(crate) fn active() -> bool {
 
 /// The frame-rate line's.
 pub(crate) fn log(frames: f64) {
-    if !enabled() {
+    if !on() {
         return;
     }
     let t: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -296,6 +311,38 @@ fn touched(table: &mut Table, block: usize, frame: u64) {
 /// (a piece: within one 64 KiB block of title memory), and the flight has
 /// landed. Whether the piece is held here, not to be fetched now.
 pub(crate) fn defer(copy: &Arc<Shadow>, lo: usize, hi: usize, after: u64) -> bool {
+    hold(copy, lo, hi, after, Hold::Lazy)
+}
+
+/// How [`hold`] holds a piece.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// As the switch holds it.
+    Lazy,
+    /// For one frame, to see whether the title reads it
+    /// (`VICTORY_MEMORY_BY_USE=1`, `crate::byuse`), without the switch.
+    Sample,
+    /// Only if its block is held already: joined to what is held.
+    Joined,
+}
+
+/// Without the switch, with `crate::byuse` on: [`defer`] of a piece
+/// sampled for the title's reads, held for one frame. Only with what the
+/// switch rests on ([`enabled`]).
+pub(crate) fn defer_sampled(copy: &Arc<Shadow>, lo: usize, hi: usize, after: u64) -> bool {
+    static CAN: OnceLock<bool> = OnceLock::new();
+    let can = *CAN.get_or_init(|| crate::shadow::relay() && crate::land::on() && crate::land::beside_on());
+    can && hold(copy, lo, hi, after, Hold::Sample)
+}
+
+/// Without the switch, while samples are held: [`defer`] of a piece whose
+/// block is held already, so that it lands with what is held there and
+/// not before it. Never holds a block anew.
+pub(crate) fn defer_joined(copy: &Arc<Shadow>, lo: usize, hi: usize, after: u64) -> bool {
+    active() && hold(copy, lo, hi, after, Hold::Joined)
+}
+
+fn hold(copy: &Arc<Shadow>, lo: usize, hi: usize, after: u64, how: Hold) -> bool {
     let title = copy.span().0 as usize + lo;
     let block = title / BLOCK;
     if lo >= hi || (title + (hi - lo) - 1) / BLOCK != block {
@@ -317,10 +364,16 @@ pub(crate) fn defer(copy: &Arc<Shadow>, lo: usize, hi: usize, after: u64) -> boo
         };
         joined(&mut held.ranges, lo, hi);
         held.after = held.after.max(after);
-        held.frame = frame;
+        // A sample is landed a frame after it was held, written again or not.
+        if !held.sampled {
+            held.frame = frame;
+        }
         count(stat::AGAIN, 1);
         count(stat::BYTES, (hi - lo) as u64);
         return true;
+    }
+    if how == Hold::Joined {
+        return false;
     }
     if stays_hot(&mut table, block, frame) {
         count(stat::HOT, 1);
@@ -353,8 +406,18 @@ pub(crate) fn defer(copy: &Arc<Shadow>, lo: usize, hi: usize, after: u64) -> boo
     }
     table.held.insert(
         block,
-        Held { copy: copy.clone(), ranges: vec![(lo, hi)], after, views, frame, landing: false, wanted: false },
+        Held {
+            copy: copy.clone(),
+            ranges: vec![(lo, hi)],
+            after,
+            views,
+            frame,
+            landing: false,
+            wanted: false,
+            sampled: how == Hold::Sample,
+        },
     );
+    copy.by_use_sampled();
     HELD.fetch_add(1, Ordering::AcqRel);
     count(stat::NEW, 1);
     count(stat::BYTES, (hi - lo) as u64);
@@ -478,6 +541,12 @@ fn land(claims: Vec<Claim>, why: usize) {
     let pieces: Vec<(Arc<Shadow>, usize, usize)> =
         landing.0.iter().flat_map(|c| c.ranges.iter().map(move |&(lo, hi)| (c.copy.clone(), lo, hi))).collect();
     let (bytes, ran_behind) = fetch(&pieces);
+    // `crate::byuse`: the title's CPU read what shaders wrote there.
+    if why == stat::READ {
+        for claim in &landing.0 {
+            claim.copy.by_use_title_read();
+        }
+    }
     count(why, landing.0.len() as u64);
     count(stat::FETCHES, 1);
     count(stat::LANDED_BYTES, bytes.len() as u64);
@@ -590,14 +659,9 @@ pub(crate) fn tend() {
     let frame = crate::frame::current();
     land_where(|table| table.held.iter().filter(|(_, h)| h.wanted).map(|(&b, _)| b).collect(), stat::WANTED);
     let idle = idle();
-    if idle != 0 {
-        land_where(
-            |table| {
-                table.held.iter().filter(|(_, h)| h.frame.saturating_add(idle) <= frame).map(|(&b, _)| b).take(TEND_MOST).collect()
-            },
-            stat::IDLE,
-        );
-    }
+    // Samples (`crate::byuse`) go after one frame, whatever [`idle`] says.
+    let due = |h: &Held| if h.sampled { h.frame < frame } else { idle != 0 && h.frame.saturating_add(idle) <= frame };
+    land_where(|table| table.held.iter().filter(|&(_, h)| due(h)).map(|(&b, _)| b).take(TEND_MOST).collect(), stat::IDLE);
 }
 
 #[cfg(test)]

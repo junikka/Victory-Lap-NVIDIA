@@ -511,7 +511,20 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            if bytes.is_empty() {
+                let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+                (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                    windows::core::Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &<ID3D12PipelineLibrary as windows::core::Interface>::IID,
+                    &mut raw,
+                )
+                .ok()?;
+                <ID3D12PipelineLibrary as windows::core::Interface>::from_raw(raw).cast()
+            } else {
+                device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            }
         }
     };
     if !blob.bytes().is_empty() {

@@ -30,6 +30,9 @@ unsafe impl Sync for Stamps {}
 
 static STAMPS: OnceLock<Option<Stamps>> = OnceLock::new();
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+/// Submissions stamped for the frame timeline (`VICTORY_FRAME_TIMELINE`),
+/// which uses the places over and over.
+static RING: AtomicUsize = AtomicUsize::new(0);
 
 /// Makes the lists, before the recording begins.
 pub(crate) fn timeline_ready() {
@@ -47,11 +50,54 @@ pub(crate) fn timeline_ready() {
 
 /// The place of the next submission's stamps, if the timeline records.
 pub(super) fn take() -> Option<usize> {
-    if !crate::timeline::on() || STAMPS.get()?.is_none() {
+    let stamps = STAMPS.get()?.as_ref()?;
+    if crate::timeline::on() {
+        let at = NEXT.fetch_add(1, Ordering::Relaxed);
+        return (at < MOST).then_some(at);
+    }
+    if !crate::timeline::card_table() {
         return None;
     }
-    let at = NEXT.fetch_add(1, Ordering::Relaxed);
-    (at < MOST).then_some(at)
+    // The frame timeline: every submission, the places used in a ring. What
+    // the card wrote there the last time round is long read.
+    let at = RING.fetch_add(1, Ordering::Relaxed) % MOST;
+    // SAFETY: the mapping holds twice `MOST` tick counts.
+    unsafe {
+        let back = stamps.back as *mut u64;
+        back.add(at).write_volatile(0);
+        back.add(MOST + at).write_volatile(0);
+    }
+    Some(at)
+}
+
+/// How many submissions the frame timeline's ring has stamped so far.
+pub(crate) fn ring_taken() -> usize {
+    RING.load(Ordering::Relaxed)
+}
+
+/// From when to when the submission at `at` of the ring ran, in the card's
+/// ticks, once the card has run it.
+pub(crate) fn ring_stamp(at: usize) -> Option<(u64, u64)> {
+    let stamps = STAMPS.get()?.as_ref()?;
+    // SAFETY: the mapping holds twice `MOST` tick counts.
+    let (from, to) = unsafe {
+        let back = stamps.back as *const u64;
+        (back.add(at % MOST).read_volatile(), back.add(MOST + at % MOST).read_volatile())
+    };
+    (from != 0 && to != 0).then_some((from, to))
+}
+
+/// The card's ticks and the PC's counter at one moment, and the card's
+/// ticks a second.
+pub(crate) fn card_calibration() -> Option<(u64, u64, u64)> {
+    let host = host()?;
+    let (mut card, mut pc) = (0, 0);
+    // SAFETY: plain queries.
+    unsafe {
+        host.queue.GetClockCalibration(&mut card, &mut pc).ok()?;
+        let frequency = host.queue.GetTimestampFrequency().ok()?;
+        (frequency != 0).then_some((card, pc, frequency))
+    }
 }
 
 /// The list that goes ahead of the submission at `at`, and the one behind.

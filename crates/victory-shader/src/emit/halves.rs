@@ -119,7 +119,7 @@ impl<'a> Lower<'a> {
             let half = matches!(d.source, Source::Loaded { .. })
                 && inst.is_some_and(|i| {
                     (i.name().starts_with("buffer_") && i.name().contains("_format_d16_"))
-                        || self.format_load_read_as_halves(i)
+                        || (super::half_loads_on() && self.format_load_read_as_halves(i))
                 });
             for leaf in d.source.leaves() {
                 let Source::Loaded { load, .. } = leaf else {

@@ -409,6 +409,9 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if SLOT == 0x218 && slot67_parse() {
         log_slot67(desc);
     }
+    if SLOT == 0x1c8 && slot57_parse() && (calls <= SLOT57_LOGGED || calls.is_power_of_two()) {
+        log_slot57(desc, calls);
+    }
     refusal(fast_fallback())
 }
 
@@ -445,6 +448,97 @@ fn slot67_parse() -> bool {
 
 fn flag_is_one(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| v == "1")
+}
+
+/// `VICTORY_SLOT57_PARSE=1` (ticket 138; off unless the variable is `1`)
+/// logs what the first [`SLOT57_LOGGED`] calls of 0x1c8 carry, and each
+/// call whose number is a power of two: the description is a root
+/// signature and six pieces, each a pointer and a size (runs fp-1 to
+/// p14-nt-099: two of 0x17c-0x184 and 0xbc bytes, then twice a piece of
+/// 0x140-0x300 bytes in the title's code pages and one of 0x30-0x2f0
+/// bytes; a pair may be absent). The two first pieces are logged whole,
+/// the others by size and hash, so that they can be set against the
+/// ordinary creation (0x2b0) the title makes later under the same root.
+/// The result stays the refusal.
+fn slot57_parse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag_is_one(std::env::var_os("VICTORY_SLOT57_PARSE").as_deref()))
+}
+
+/// Calls of 0x1c8 logged one by one with [`slot57_parse`].
+const SLOT57_LOGGED: u32 = 256;
+/// Pieces in a slot 0x1c8 description, after the root signature.
+const SLOT57_PIECES: usize = 6;
+/// A state piece (the first two) longer than this is logged by hash only.
+const SLOT57_MOST_HEX: usize = 1024;
+
+/// Pointer and claimed size of the six pieces. Word 0 is the root
+/// signature; each piece is a pointer then a size, little-endian.
+fn slot57_pieces(words: &[u64]) -> [(u64, u64); SLOT57_PIECES] {
+    let mut pieces = [(0, 0); SLOT57_PIECES];
+    for (i, piece) in pieces.iter_mut().enumerate() {
+        *piece = (
+            words.get(1 + i * 2).copied().unwrap_or(0),
+            words.get(2 + i * 2).copied().unwrap_or(0),
+        );
+    }
+    pieces
+}
+
+/// One piece for the log: `size:` and its bytes in hex (the first two
+/// pieces, up to [`SLOT57_MOST_HEX`] bytes), or the first 16 hex digits of
+/// their BLAKE3; `unread` when the bytes could not be read, `-` when the
+/// piece is absent.
+fn slot57_piece_text(index: usize, size: u64, data: Option<&[u8]>) -> String {
+    if size == 0 {
+        return "-".to_owned();
+    }
+    match data {
+        None => format!("{size}:unread"),
+        Some(bytes) if index < 2 && bytes.len() <= SLOT57_MOST_HEX => {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{size}:{hex}")
+        }
+        Some(bytes) => format!("{size}:#{}", program_hash(bytes)),
+    }
+}
+
+fn log_slot57(desc: *const u8, calls: u32) {
+    #[cfg(windows)]
+    {
+        const WORDS: usize = 1 + SLOT57_PIECES * 2;
+        let mut bytes = [0u8; WORDS * 8];
+        if desc.is_null() || !crate::host::read_into(desc, &mut bytes) {
+            tracing::info!(
+                slot = format_args!("{:#x}", 0x1c8),
+                calls,
+                "a precompiled pipeline whose description could not be read"
+            );
+            return;
+        }
+        let mut words = [0u64; WORDS];
+        for (i, chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
+            words[i] = u64::from_le_bytes(*chunk);
+        }
+        let pieces = slot57_pieces(&words);
+        let texts: Vec<String> = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, &(at, size))| slot57_piece_text(i, size, read_piece(at, size).as_deref()))
+            .collect();
+        tracing::info!(
+            slot = format_args!("{:#x}", 0x1c8),
+            calls,
+            root = format_args!("{:#x}", words[0]),
+            code = format_args!("{:#x},{:#x}", pieces[2].0, pieces[4].0),
+            pieces = %texts.join(" "),
+            "a precompiled pipeline"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (desc, calls);
+    }
 }
 
 /// FSPX kinds in a slot 0x218 description, after the root signature.
@@ -711,6 +805,43 @@ mod tests {
         assert!(!flag_is_one(Some(std::ffi::OsStr::new("0"))));
         assert!(!flag_is_one(Some(std::ffi::OsStr::new(""))));
         assert!(flag_is_one(Some(std::ffi::OsStr::new("1"))));
+    }
+
+    #[test]
+    fn slot57_pieces_are_pointer_and_size_after_the_root() {
+        // Call 3 of run p14-nt-099: the first pair of the last four is absent.
+        let words = [
+            0x1e190432610, 0x9055887fc, 0x17c, 0x905588978, 0xbc, 0, 0, 0, 0, 0x94f3dfa00, 0x140, 0x905588a34, 0x30,
+        ];
+        assert_eq!(
+            slot57_pieces(&words),
+            [
+                (0x9055887fc, 0x17c),
+                (0x905588978, 0xbc),
+                (0, 0),
+                (0, 0),
+                (0x94f3dfa00, 0x140),
+                (0x905588a34, 0x30)
+            ]
+        );
+        assert_eq!(slot57_pieces(&[]), [(0, 0); SLOT57_PIECES]);
+        assert_eq!(slot57_pieces(&[7, 8])[0], (8, 0));
+    }
+
+    #[test]
+    fn slot57_piece_text_shows_state_whole_and_code_by_hash() {
+        assert_eq!(slot57_piece_text(0, 0, Some(&[])), "-");
+        assert_eq!(slot57_piece_text(2, 0, None), "-");
+        assert_eq!(slot57_piece_text(1, 3, None), "3:unread");
+        assert_eq!(slot57_piece_text(0, 3, Some(&[0x01, 0xab, 0x00])), "3:01ab00");
+        assert_eq!(slot57_piece_text(1, 2, Some(&[0xff, 0x10])), "2:ff10");
+        let code = [0x55u8; 64];
+        assert_eq!(slot57_piece_text(2, 64, Some(&code)), format!("64:#{}", program_hash(&code)));
+        let long = vec![0u8; SLOT57_MOST_HEX + 1];
+        assert_eq!(
+            slot57_piece_text(0, long.len() as u64, Some(&long)),
+            format!("{}:#{}", long.len(), program_hash(&long))
+        );
     }
 
     #[test]

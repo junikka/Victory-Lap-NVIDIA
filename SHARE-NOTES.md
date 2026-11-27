@@ -1,7 +1,7 @@
 # About this copy
 
-Source of play13 (2026-11-26): the VIctory D3D12 layer, base cool_fox, plus our ports and fixes.
-Exported with `git archive` from commit 59cc8d7d, without history.
+Source of play29 (2026-11-27; run as play30 with VICTORY_BVH_LOG_ONCE=1): the VIctory D3D12 layer, base cool_fox, plus our ports and fixes. First shared as play13 on 2026-11-26.
+Exported with `git archive` from commit f321192d, without history.
 
 - No game files, keys, saves or build output.
 - Licence: GPL-3.0 (see LICENSE); keep it when sharing.

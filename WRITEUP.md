@@ -1,6 +1,6 @@
 # VIctory on an RTX 3080: what we did and where it stands
 
-*Status: 26 November 2026, build "play13". Measured on one PC: i9-12900F, RTX 3080 10 GB, 32 GB RAM, Windows 11, 1920x1080, Series S profile.*
+*Status: 27 November 2026, build "play30" (play29 source + one launcher switch). First published as play13 on 26 November. Measured on one PC: i9-12900F, RTX 3080 10 GB, 32 GB RAM, Windows 11, 1920x1080, Series S profile.*
 
 ## Is this our own build?
 
@@ -25,6 +25,23 @@ Same route in the open world, comparable load (6,000-9,500 draws a frame):
 | Lowest free PC memory in play | 3-4 GB | 2.5-2.8 GB |
 
 The run with the panel on shows up to 18 fps at 5,000 draws. **It is playable but not smooth yet:** the goal is a stable 30 fps.
+
+## Update, 27 November: play29 / play30
+
+Measured on a fixed camera-spin route (480 s, scored from world entry + 150 s in 5 s windows), so the numbers are not the same route as the play13 table above:
+
+| | play29 | **play30** |
+|---|---|---|
+| Average frame rate | 12.9-13.0 fps | **17.6-19.1 fps** |
+| Frame time (median of 5 s windows) | 77-78 ms | **52-57 ms** |
+| Draws a frame | 5,100-5,500 | 5,100-6,500 |
+| Lowest free PC memory | 5.5 GB | 4.1-5.3 GB |
+| Card memory | 75-77 % of 9.2 GB | 75-77 % |
+
+- **play29** adds about 130 commits over play13: a memory set (card windows behind a 2 GB bar, mapped-memory trims, port guards and constants, dirty lists) and submit-side fixes, each turned on only after its own on/off runs on this PC (working set -1.4 GB, submitting thread -10 to -12 ms, slow windows 26 -> 2).
+- **play30** is the same code with `VICTORY_BVH_LOG_ONCE=1`. Our Windows stand-in for the title's BVH-builder DLL wrote a log line on every call, about 110 a frame. Logging once took 21-24 ms off every frame in two on/off pairs. The stand-in is in our private tooling, not in this repository; with the title's own DLL there is no such cost, and the switch does nothing.
+- **Where the frame goes now:** with no draws at all the title runs at its own 30 fps cap, so its CPU turn fits. What is left is our side: preparing the title's recorded draws (33-38 ms), the submitting thread (42-50 ms) and the card (43-49 ms). With the card's work removed the frame is still about 46 ms.
+- **Tried tonight and not kept:** moving heap-record upkeep after the submission's signal (the wait fell a third, not half), a per-thread lookup cache (worse in its first pair), 14 recording threads (less free memory and a 1.8 s stall).
 
 ## The technical approach
 

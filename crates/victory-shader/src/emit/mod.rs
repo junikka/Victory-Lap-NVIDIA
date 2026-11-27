@@ -133,7 +133,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave, typed_offset_refused};
+pub use lower::{
+    half_loads_on, half_views_on, host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave, typed_offset_refused,
+};
 pub use per_program::{deep_skips_allowed, for_program, mask_copies, wave64_program, wave64_retried, wave_wide_only};
 pub(crate) use per_program::{current as program_hash, mask_copies_here, wave_wide_only_here};
 #[cfg(test)]
@@ -361,7 +363,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & (bitcode::opt::ALL | bitcode::opt::FAST | bitcode::opt::NARROW))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -1609,7 +1611,12 @@ mod tests {
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        let fast = super::bitcode::opt::FAST;
+        let narrow = super::bitcode::opt::NARROW;
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all | fast | narrow);
+        assert_eq!(parse_shader_opt(Some("383")), all | narrow);
+        assert_eq!(parse_shader_opt(Some("255")), all | fast);
+        assert_eq!(parse_shader_opt(Some("191")), usual | fast);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
 

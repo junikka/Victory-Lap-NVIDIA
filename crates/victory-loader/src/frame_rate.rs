@@ -90,6 +90,7 @@ pub fn title_interval_us(rate: u32, display_120: bool) -> u32 {
 
 /// A read of the setting to change: its offset in the image, what it is,
 /// and the bytes there (compared first; the replacement goes at the start).
+#[derive(Clone, Copy)]
 pub struct Site {
     pub at: usize,
     pub kind: Kind,
@@ -182,6 +183,16 @@ pub enum Patched {
 /// The image stays mapped and no thread runs its code yet.
 #[cfg(windows)]
 pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<Patched> {
+    // SAFETY: as the caller promises.
+    unsafe { patch(base, size, rate, sites, "VICTORY_FRAME_INTERVAL_MS") }
+}
+
+/// `apply`, the log naming `switch` (the one that asked for it).
+///
+/// # Safety
+/// As `apply`.
+#[cfg(windows)]
+pub unsafe fn patch(base: usize, size: usize, rate: u32, sites: &[Site], switch: &'static str) -> Vec<Patched> {
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -215,9 +226,9 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
             })();
             let offset = format_args!("{:#x}", site.at);
             match done {
-                Patched::Done => tracing::info!(site = %offset, kind = ?site.kind, rate, "frame rate: the title's read of its frame rate setting patched (VICTORY_FRAME_INTERVAL_MS)"),
-                Patched::Differs => tracing::warn!(site = %offset, "frame rate: not patched, the title's bytes there are not the ones expected (another build?)"),
-                Patched::Failed(why) => tracing::warn!(site = %offset, why, "frame rate: not patched"),
+                Patched::Done => tracing::info!(site = %offset, kind = ?site.kind, rate, switch, "frame rate: the title's read of its frame rate setting patched"),
+                Patched::Differs => tracing::warn!(site = %offset, switch, "frame rate: not patched, the title's bytes there are not the ones expected (another build?)"),
+                Patched::Failed(why) => tracing::warn!(site = %offset, switch, why, "frame rate: not patched"),
             }
             done
         })

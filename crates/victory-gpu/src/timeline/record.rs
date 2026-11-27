@@ -171,14 +171,24 @@ pub struct Span {
     name: &'static str,
     /// When it began (0: nothing is recorded).
     began: u64,
+    /// The span this thread was in, for the frame timeline.
+    before: Option<&'static str>,
 }
 
 /// A span named `name`.
 #[inline(always)]
 pub fn span(name: &'static str) -> Span {
+    if super::cycle::on() {
+        return Span {
+            name,
+            began: ticks(),
+            before: Some(super::cycle::enter(name)),
+        };
+    }
     Span {
         name,
         began: if on() { ticks() } else { 0 },
+        before: None,
     }
 }
 
@@ -187,7 +197,9 @@ impl Span {
     #[inline(always)]
     pub fn next(&mut self, name: &'static str) {
         self.close();
-        (self.name, self.began) = (name, if on() { ticks() } else { 0 });
+        let new = span(name);
+        (self.name, self.began, self.before) = (new.name, new.began, new.before);
+        std::mem::forget(new);
     }
 
     /// The span ends here.
@@ -198,8 +210,11 @@ impl Span {
         let began = std::mem::take(&mut self.began);
         if began != 0 {
             let now = ticks();
-            if micros(now - began) >= SHORTEST {
+            if on() && micros(now - began) >= SHORTEST {
                 put(Kind::Span, self.name, (began, now), 0, 0, 0);
+            }
+            if let Some(before) = self.before.take() {
+                super::cycle::left(self.name, began, now, before);
             }
         }
     }
@@ -219,10 +234,16 @@ const RUN_GAP: u64 = 10;
 
 /// A list call of the title's that took `took` has returned.
 pub(crate) fn called(took: std::time::Duration) {
-    if !on() {
+    if !on() && !super::cycle::on() {
         return;
     }
     let inside = (took.as_nanos() as u64).saturating_mul(frequency()) / 1_000_000_000;
+    if super::cycle::on() {
+        super::cycle::called(inside);
+    }
+    if !on() {
+        return;
+    }
     let t1 = ticks();
     let t0 = t1 - inside;
     thread_local! {
@@ -293,6 +314,12 @@ pub(super) fn kernel(name: &'static str, bytes: u64, t0: u64) {
 /// Lists went to the card between `t0` ([`ticks`]) and now, the value
 /// `fence` signalled behind them, with the timestamps at `stamp`.
 pub(crate) fn sent(t0: u64, fence: u64, stamp: Option<usize>) {
+    if super::cycle::on() {
+        super::cycle::did(super::cycle::SENT, t0);
+        if let Some(stamp) = stamp.filter(|_| !on()) {
+            super::cycle::card_sent(stamp, t0);
+        }
+    }
     if on() {
         put(Kind::Sent, "ExecuteCommandLists", (t0, ticks()), fence, stamp.map_or(0, |s| s as u64 + 1), 0);
     }

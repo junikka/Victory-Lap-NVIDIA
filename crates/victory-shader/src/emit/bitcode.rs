@@ -230,6 +230,51 @@ pub(crate) struct Module {
     tags: HashMap<u32, Tag>,
 }
 
+/// The fast-math flags the 32-bit float binary operations carry with
+/// `opt::FAST`, as LLVM 3.7 bitcode writes them: 1 unsafe algebra (which in
+/// 3.7 implies all the others), 2 no NaNs, 4 no infinities, 8 no signed
+/// zeros, 16 allow reciprocal. `VICTORY_SHADER_FAST_BITS` (a number) picks
+/// them; unset or unreadable, 1 (every flag, as before the switch). From the
+/// origin fork's 62a8d51e8, whose default is 24: with unsafe algebra or
+/// no-NaNs/no-infinities a driver may take a result as never NaN or infinite
+/// and fold a later test of it to a constant (their runs 354/355: black
+/// blotches on skin and clothes with every flag); 24 keeps those tests. Part
+/// of the translation: the cache keys on every switch this crate reads.
+fn fast_math_bits() -> u64 {
+    static BITS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| parse_fast_bits(std::env::var("VICTORY_SHADER_FAST_BITS").ok().as_deref()))
+}
+
+/// [`fast_math_bits`] of the switch's value. Pure, for testing.
+fn parse_fast_bits(value: Option<&str>) -> u64 {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .map_or(1, |b| b & 0x1F)
+}
+
+#[cfg(test)]
+mod fast_bits_tests {
+    use super::parse_fast_bits;
+
+    #[test]
+    fn the_fast_math_bits_are_every_flag_unless_others_are_asked_for() {
+        // Unset or unreadable: unsafe algebra, as `opt::FAST` wrote before.
+        assert_eq!(parse_fast_bits(None), 1);
+        assert_eq!(parse_fast_bits(Some("some")), 1);
+        assert_eq!(parse_fast_bits(Some("")), 1);
+        // The origin fork's choice: no signed zeros, reciprocal.
+        assert_eq!(parse_fast_bits(Some(" 24 ")), 24);
+        assert_eq!(parse_fast_bits(Some("0x18")), 24);
+        // Only the five flags there are; 0 writes none.
+        assert_eq!(parse_fast_bits(Some("255")), 31);
+        assert_eq!(parse_fast_bits(Some("0")), 0);
+    }
+}
+
 impl Module {
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
@@ -836,6 +881,8 @@ impl Module {
         }
         w.exit();
 
+        let fast_bits = fast_math_bits();
+        let fast = super::shader_opt() & opt::FAST != 0 && fast_bits != 0;
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
@@ -850,6 +897,11 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    // A 32-bit float result takes the unsafe-algebra flag
+                    // (bit 0 of the optional fourth field) with `opt::FAST`.
+                    Op::Bin(op, a, b) if fast && self.types[inst.ty.0 as usize] == TypeDef::Float => {
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, fast_bits])
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),

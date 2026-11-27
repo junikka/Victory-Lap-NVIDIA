@@ -3,7 +3,12 @@
 //! between two times (seconds, as `VICTORY_STACKS`), and writes them counted
 //! to `<file>` at the end (several of them, one after another, with `;`
 //! between). A thread that waits is sampled like one that
-//! runs: its top frame says which (`ntdll`'s system calls).
+//! runs: its top frame says which (`ntdll`'s system calls). The four may be
+//! given with blanks between them and no comma (`<from> <to> <ms> <file>`),
+//! for a list of settings that is itself split at commas.
+//!
+//! `tools/profile/prof.py` names the frames from the build's `victory.pdb`
+//! and says, per thread, where its samples lie.
 //!
 //! The file: `thread <id> <start> <cpu ms> <samples> <name>`, then
 //! `stack <thread> <phase> <count> <frame>;<frame>;...` (innermost first, as
@@ -29,7 +34,10 @@ const CHOOSE: Duration = Duration::from_secs(1);
 
 /// What `VICTORY_PROFILE` says: from, to, every, the file.
 fn asked(list: &str) -> Option<(Duration, Duration, Duration, String)> {
-    let mut parts = list.splitn(4, ',');
+    // (Blanks between the four only where there is no comma at all: a
+    // file's name may hold either.)
+    let between = if list.contains(',') { ',' } else { ' ' };
+    let mut parts = list.trim().splitn(4, between);
     let mut seconds = || parts.next()?.trim().parse::<f64>().ok();
     let (from, to, ms) = (seconds()?, seconds()?, seconds()?);
     let of = |s: f64| Duration::try_from_secs_f64(s).ok();
@@ -191,5 +199,24 @@ mod tests {
         assert_eq!(asked("a,160,5,x"), None);
         assert_eq!(asked("-1,160,5,x"), None);
         assert_eq!(asked("1,160,0,x"), None);
+    }
+
+    /// With blanks and no comma, as a list of settings split at commas can
+    /// carry it; the file's name keeps its own blanks.
+    #[test]
+    fn the_four_may_have_blanks_between_them() {
+        assert_eq!(
+            asked("250 280 5 C:\\runs\\a b.txt"),
+            Some((
+                Duration::from_secs(250),
+                Duration::from_secs(280),
+                Duration::from_millis(5),
+                "C:\\runs\\a b.txt".to_string()
+            ))
+        );
+        assert_eq!(asked("250 280 5"), None);
+        assert_eq!(asked("250  280 5 x"), None);
+        // (A comma anywhere: the commas are what is between them.)
+        assert_eq!(asked("250 280 5 a,b.txt"), None);
     }
 }

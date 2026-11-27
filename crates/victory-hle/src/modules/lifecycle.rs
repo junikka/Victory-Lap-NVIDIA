@@ -291,7 +291,7 @@ extern "system" fn window_proc(
                 let mut rc = RECT::default();
                 let _ = wm::GetClientRect(hwnd, &mut rc);
                 FillRect(wparam as *mut c_void, &rc, brush);
-                let _ = DeleteObject(brush as *mut c_void);
+                let _ = DeleteObject(brush);
             }
         }
         return 1;

@@ -26,6 +26,7 @@ mod console_insn;
 mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
+pub mod fixed_step;
 pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
@@ -37,6 +38,8 @@ mod profile;
 mod stacks;
 #[cfg(windows)]
 mod threads;
+#[cfg(windows)]
+mod wait_sites;
 #[cfg(windows)]
 mod thunks;
 #[cfg(windows)]

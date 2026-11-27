@@ -48,7 +48,7 @@ fn lines(frame: u64, frames: u64, counts: HashMap<String, u64>) -> Vec<String> {
 /// At present number `frame`.
 pub(crate) fn at_present(frame: u64) {
     let Some(path) = file() else { return };
-    if frame % EVERY != 0 {
+    if !frame.is_multiple_of(EVERY) {
         return;
     }
     let taken = std::mem::take(&mut *counts().lock().unwrap_or_else(|e| e.into_inner()));

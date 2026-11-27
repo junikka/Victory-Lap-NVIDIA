@@ -202,7 +202,7 @@ pub(crate) fn while_no_code_is_patched<R>(body: impl FnOnce() -> R) -> R {
 ///
 /// # Safety
 /// `at` is in code that stays mapped, and `patch` does for it what `was` does.
-unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
+pub(crate) unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
@@ -321,7 +321,7 @@ mod sites {
     }
 }
 
-fn readable(va: usize, bytes: usize) -> bool {
+pub(crate) fn readable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -428,6 +428,23 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                     VirtualProtect(rip as *const _, len, old, &mut old);
                 }
             }
+        }
+        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx if crate::wait_sites::wanted() => {
+            // Asked for (`VICTORY_WAIT_COUNT`, `VICTORY_MWAITX`): the wait is counted and
+            // made the way asked, here and, once the place is hooked, without a fault. A
+            // place that cannot be hooked is replaced as below.
+            let wait = what == ConsoleOnly::Mwaitx;
+            if len == 3 && !crate::wait_sites::by_fault() && patches_waits() {
+                let was = [code[0], code[1], code[2]];
+                // SAFETY: the title's code, where the instruction just faulted; the hook and
+                // the replacement both wait for nothing longer than the instruction may.
+                let done = unsafe { crate::wait_sites::hook(rip, was, wait) || wait_patch(what).is_some_and(|new| patch(rip, was, new)) };
+                if done {
+                    #[cfg(feature = "diagnostics")]
+                    sites::patched();
+                }
+            }
+            crate::wait_sites::pass_from_fault(rip, wait, ctx.Rax, ctx.Rbx, ctx.Rcx);
         }
         ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
             // Without a prefix, so 3 bytes: replaced, the next pass does not fault.

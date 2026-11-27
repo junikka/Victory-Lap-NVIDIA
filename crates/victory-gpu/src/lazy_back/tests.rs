@@ -227,6 +227,37 @@ fn every_view_of_a_page_is_held() {
     assert!(!active());
 }
 
+/// Ticket 110 (`VICTORY_SKIP_WC_BACK_HOLD=1`, the hold `relay_card_back`
+/// asks for a piece the skip would leave): in a page the title shows at two
+/// addresses the piece is not fetched, flight after flight; both addresses
+/// are unreadable together; a later title read through the other address
+/// gets the shaders' newest bytes with one fetch; and both addresses come
+/// back together, as the guards left them.
+#[test]
+fn a_held_piece_at_two_addresses_is_not_fetched_and_the_title_still_reads_the_shaders_bytes() {
+    let views = title(BLOCK, 2, 0x88);
+    let (one, two) = (views[0], views[1]);
+    let (copy, _) = copy(one, BLOCK);
+    guard(one, BLOCK);
+    let before = fetches();
+    shade(&copy, &[0x40, 0x8000], 0xeeee_0001);
+    assert!(defer(&copy, 0, BLOCK, 1));
+    crate::census::hold_done(BLOCK, true, true);
+    shade(&copy, &[0x40], 0xeeee_0002);
+    assert!(defer(&copy, 0, BLOCK, 2), "a later flight's piece is held with it");
+    assert_eq!(fetches(), before, "nothing came over the bus");
+    assert_eq!((protection(one), protection(two)), (PAGE_NOACCESS, PAGE_NOACCESS), "both addresses leave together");
+    assert!(crate::watch::lazy_any(one, BLOCK) && crate::watch::lazy_any(two, BLOCK));
+    assert_eq!(read(two + 0x40), 0xeeee_0002);
+    assert_eq!(fetches(), before + 1);
+    assert_eq!(read(one + 0x8000), 0xeeee_0001);
+    assert_eq!(read(one + 0x44), 0x8888_8888, "what no shader wrote is the title's");
+    assert_eq!(fetches(), before + 1);
+    assert_eq!((protection(one), protection(two)), (PAGE_READONLY, PAGE_READONLY), "and come back together");
+    assert!(!crate::watch::lazy_any(one, BLOCK) && !crate::watch::lazy_any(two, BLOCK));
+    assert!(held(&copy, one, one + BLOCK).is_empty());
+}
+
 /// A block the title reads in frame after frame is fetched at once again,
 /// and held anew when it has not been read for a while.
 #[test]

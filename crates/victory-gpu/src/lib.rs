@@ -30,7 +30,17 @@ mod compose;
 pub mod console;
 pub mod failed;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod account;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+
+/// Release builds with the `mimalloc` feature: the Rust side allocates
+/// through mimalloc (per-thread caches) instead of the process heap, which
+/// it shares with the title and the drivers. Diagnostics builds count every
+/// block through `copystat`'s allocator, which then uses mimalloc too.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
@@ -51,6 +61,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+#[cfg(windows)]
+mod byuse;
 #[cfg(windows)]
 mod census;
 #[cfg(windows)]
@@ -106,6 +118,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod readkinds;
+#[cfg(windows)]
 mod shadow;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod shot;
@@ -120,6 +134,8 @@ mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
 #[cfg(windows)]
+mod mapped_trim;
+#[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
 mod texture;
@@ -130,6 +146,9 @@ pub mod titlewrite;
 mod upload;
 #[cfg(windows)]
 mod watch;
+mod waitwhy;
+#[cfg(windows)]
+mod windowskip;
 #[cfg(windows)]
 mod texback;
 
@@ -141,8 +160,43 @@ pub use cores::{
 };
 #[cfg(windows)]
 pub use census::title_memory_reserved;
+pub use waitwhy::note_disk_window;
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// Whether the memory account is kept (`VICTORY_MEMORY_ACCOUNT`,
+/// diagnostics builds): the runtime then answers the title's plain
+/// `VirtualAlloc` import itself and tells of each allocation
+/// ([`title_host_allocation`]). Otherwise that import is the host's own
+/// function, as it always was.
+pub fn memory_account_on() -> bool {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        account::on()
+    }
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    {
+        false
+    }
+}
+
+/// The title made an allocation of `size` bytes at `at` with its plain
+/// `VirtualAlloc` import (for the memory account; nothing else reads it).
+pub fn title_host_allocation(at: usize, size: usize) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    account::title_plain(at, size as u64);
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    let _ = (at, size);
+}
+
+/// The title released the allocation at `at` it made with its plain
+/// `VirtualAlloc` import (for the memory account).
+pub fn title_host_released(at: usize) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    account::title_plain_gone(at);
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    let _ = at;
+}
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

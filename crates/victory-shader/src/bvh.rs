@@ -278,6 +278,7 @@ pub(crate) const HIT_FOLD: [(u32, u32); 2] = [(15, 0x2C1B_3C6D), (12, 0x297A_2D3
 /// registers' bits. `share` is the fraction of the 16-bit range that hits;
 /// 0 hits nothing and 1 hits every ray.
 pub fn stand_in_hits(direction: [u32; 3], share: f32) -> bool {
+    // NaN hits nothing, as 0 does.
     if share.is_nan() || share <= 0.0 {
         return false;
     }

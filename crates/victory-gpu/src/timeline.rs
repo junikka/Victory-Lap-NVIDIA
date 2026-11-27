@@ -19,16 +19,45 @@
 //!
 //! Without the variable nothing is wrapped and a span is one load of a
 //! flag; a build without `diagnostics` has nothing of it.
+//!
+//! Two more, each off unless set, look at every frame and not at a few:
+//! `VICTORY_FRAME_TIMELINE=1` (or `csv`) prints every five seconds where the
+//! frame's time went on the title's side ([`cycle`]), and
+//! `VICTORY_THREAD_SAMPLES=<processor>` (or `busiest`) where one of the
+//! title's threads was ([`samples`]).
 
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
+mod cycle;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod hooks;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod record;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod report;
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
+mod samples;
 
 #[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use cycle::{present_begins, title_thread_started};
+#[cfg(all(windows, feature = "diagnostics"))]
 pub use hooks::import;
+
+/// Whether every submission is stamped for the frame timeline's table of
+/// the card: not while a timeline of a few frames is asked for too, which
+/// uses the same stamps.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn card_table() -> bool {
+    cycle::on() && !record::wanted()
+}
+
+/// The title's present came back: a frame of the frame timeline
+/// (`VICTORY_FRAME_TIMELINE`) ends, and the samples of one of the title's
+/// threads (`VICTORY_THREAD_SAMPLES`) begin with the first.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn frame_presented() {
+    cycle::presented();
+    samples::start();
+}
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use record::{Span, span};
 #[cfg(all(windows, feature = "diagnostics"))]

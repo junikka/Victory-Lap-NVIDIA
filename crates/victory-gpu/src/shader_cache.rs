@@ -153,6 +153,13 @@ fn fingerprint() -> [u8; 32] {
             victory_shader::emit::dispatch_spread_compiled(),
             victory_shader::emit::typed_offset_refused(),
         ));
+        // The float path for halves (`VICTORY_HALF_VIEWS=0`,
+        // `VICTORY_HALF_LOADS=0`): only when off, so the translations cached
+        // with the half views keep their key.
+        bytes.extend_from_slice(half_marks(
+            victory_shader::emit::half_views_on(),
+            victory_shader::emit::half_loads_on(),
+        ));
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -192,6 +199,17 @@ fn opt_in_marks(constants_raw: bool, spread: bool, typed_offset_refused: bool) -
         bytes.extend_from_slice(b"VICTORY_TYPED_OFFSET=refuse");
     }
     bytes
+}
+
+/// What the half switches add to [`build`]'s bytes: nothing with both on
+/// (the default), else the one that is off (`VICTORY_HALF_VIEWS=0` turns
+/// the loads off too).
+fn half_marks(views: bool, loads: bool) -> &'static [u8] {
+    match (views, loads) {
+        (false, _) => b"VICTORY_HALF_VIEWS=0",
+        (true, false) => b"VICTORY_HALF_LOADS=0",
+        (true, true) => b"",
+    }
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -866,6 +884,16 @@ mod tests {
         h.update(&build);
         h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
         assert_eq!(program_key(&build, true, false, false), *h.finalize().as_bytes());
+    }
+
+    /// The float path for halves (kitty 046f8d029) is its own set of
+    /// translations; with the half views on, the key is as before.
+    #[test]
+    fn half_switches_mark_the_key_only_when_off() {
+        assert!(half_marks(true, true).is_empty(), "on: the key the cache already has");
+        assert_eq!(half_marks(false, true), b"VICTORY_HALF_VIEWS=0");
+        assert_eq!(half_marks(false, false), b"VICTORY_HALF_VIEWS=0");
+        assert_eq!(half_marks(true, false), b"VICTORY_HALF_LOADS=0");
     }
 
     #[test]

@@ -464,7 +464,7 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     make::ready(&pipeline(this).host)
@@ -478,10 +478,38 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 /// compare of the nine words.
 #[cfg(windows)]
 pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     make::for_draw(&pipeline(this).host, bound)
+}
+
+/// `VICTORY_NO_DRAWS=1`: no host pipeline is handed out, none is made ahead and no shader
+/// is translated for one, so every draw and dispatch of the title's is dropped where it
+/// asks for its pipeline. The title runs as before (its code, streaming, memory, its lists,
+/// submissions and presents) and the picture stays black: the frame time then is the
+/// title's own code and our system services, the ceiling no graphics work can raise.
+/// Diagnostics only; off unless set to `1`.
+///
+/// After kelvaroq (fablinoo), `native/patches/0061-no-draw.patch`, which names the switch of
+/// the same name in Cold Project VI (GPL-3.0) as its source. Ours also covers the pipelines
+/// asked for by target formats ([`host_pipeline_for`]), which theirs does not have.
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = no_draws_asked(std::env::var_os("VICTORY_NO_DRAWS").as_deref());
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: no pipelines, no shaders, nothing of the title drawn");
+        }
+        on
+    })
+}
+
+/// Only `1` turns the draws off.
+#[cfg(windows)]
+fn no_draws_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
 }
 
 /// Host pipelines queued and not made yet.
@@ -605,7 +633,9 @@ fn hand_out(
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    if !no_draws() {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -815,6 +845,8 @@ mod make;
 #[cfg(windows)]
 pub(crate) fn trim_library() {
     library::trim();
+    // The other mapped files' pages, if asked for (`VICTORY_MAPPED_TRIM`).
+    crate::mapped_trim::tick();
 }
 
 /// The pipeline library's part of the report when the host device is
@@ -841,6 +873,22 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(windows)]
+    #[test]
+    fn only_one_turns_the_draws_off() {
+        use std::ffi::OsStr;
+        assert!(!no_draws_asked(None));
+        assert!(no_draws_asked(Some(OsStr::new("1"))));
+        for other in ["", "0", "on", "true", "2", " 1"] {
+            assert!(!no_draws_asked(Some(OsStr::new(other))), "{other:?}");
+        }
+        // Not set in a test run: the pipelines are handed out as ever.
+        if std::env::var_os("VICTORY_NO_DRAWS").is_none() {
+            assert!(!no_draws());
+        }
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

@@ -638,10 +638,13 @@ fn clear_sets(thread: *mut core::ffi::c_void) {
 /// prefers the fast cores. Safe to call before the Rust runtime has set the
 /// thread up: it does not log and does not touch a thread local.
 pub fn place_title_current() {
-    if !TITLE.may() { return }
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId};
     // SAFETY: the calling thread.
     let id = unsafe { GetCurrentThreadId() };
+    // Diagnostics: the frame timeline and the samples know the title's threads.
+    #[cfg(feature = "diagnostics")]
+    crate::timeline::title_thread_started(id);
+    if !TITLE.may() { return }
     note(id, Kind::Title);
     if TITLE.on() {
         // SAFETY: the calling thread's pseudo-handle.
@@ -650,11 +653,18 @@ pub fn place_title_current() {
 }
 
 /// `thread` was just created for the title. See [`place_title_current`].
-pub fn place_title_handle(thread: *mut core::ffi::c_void) {
-    if thread.is_null() || !TITLE.may() { return }
+///
+/// # Safety
+/// `thread` is null or a live thread handle of this process: the handle is
+/// handed to the system to read and to set the thread's cores.
+pub unsafe fn place_title_handle(thread: *mut core::ffi::c_void) {
+    if thread.is_null() { return }
     use windows_sys::Win32::System::Threading::GetThreadId;
     // SAFETY: the handle `CreateThread` just returned; 0 if it is not a thread.
     let id = unsafe { GetThreadId(thread) };
+    #[cfg(feature = "diagnostics")]
+    crate::timeline::title_thread_started(id);
+    if !TITLE.may() { return }
     note(id, Kind::Title);
     if TITLE.on() { select(thread, fast_cached()) }
 }

@@ -65,7 +65,7 @@ fn mode() -> Mode {
         match std::env::var("VICTORY_FPS_COUNTER").as_deref() {
             Ok("0") => Mode::Off,
             Ok("fps") => Mode::Rate,
-            // The full box only when asked (Jon: "the box can go as long as
+            // The full box only when asked (the player asked: "the box can go as long as
             // you get logs"); the load figures are logged either way.
             _ if hud.as_deref() == Ok("1") => Mode::All,
             _ => Mode::Rate,
@@ -403,7 +403,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
     let Some(bytes) = pixel_bytes(format).filter(|_| tenths != u32::MAX) else {
         return;
     };
-    // A third of the size it was (Jon: "make it like 1/3 size"): 2 dots a
+    // A third of the size it was (the player asked: "make it like 1/3 size"): 2 dots a
     // pixel at 2160 lines, 1 at 1080.
     let scale = (height / 1080).clamp(1, 4);
     let stats = (mode == Mode::All).then(|| {

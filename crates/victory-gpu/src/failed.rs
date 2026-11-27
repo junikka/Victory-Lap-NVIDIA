@@ -144,6 +144,7 @@ fn field(text: &str) -> String {
 /// is unset. Such a pipeline is never made; it is not "being made". With
 /// the switch on, the row is `left out` plus the pipeline hash and that name
 /// ([`making_drop`]).
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) const LEFT_OUT: &str = "left out on purpose (ray tracing): ";
 
 /// Whether `text` is a pipeline hash ([`crate::pipeline::make`]'s key): 32 hex digits.
@@ -157,15 +158,9 @@ fn is_pipeline(text: &str) -> bool {
 /// has no hash, so it is not this).
 #[cfg(any(test, feature = "diagnostics"))]
 fn split_making(why: &str) -> Option<(String, String, String)> {
-    let (reason, rest) = if let Some(rest) = why.strip_prefix("never started ") {
-        ("never started", rest)
-    } else if let Some(rest) = why.strip_prefix("queued ") {
-        ("queued", rest)
-    } else if let Some(rest) = why.strip_prefix("left out ") {
-        ("left out", rest)
-    } else {
-        return None;
-    };
+    let (reason, rest) = ["never started", "queued", "left out"]
+        .into_iter()
+        .find_map(|reason| Some((reason, why.strip_prefix(reason)?.strip_prefix(' ')?)))?;
     let (pipeline, shader) = rest.split_once(' ')?;
     if !is_pipeline(pipeline) || shader.is_empty() {
         return None;
@@ -220,14 +215,15 @@ pub(crate) fn making_line(drops: &[(String, u64)], frames: f64) -> Option<String
     ))
 }
 
+#[cfg(any(test, feature = "diagnostics"))]
 fn is_hash(text: &str) -> bool {
     text.len() == 16 && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A drop's reason as [`crate::pipeline::note_why`] has it, as id, stage
 /// and reason.
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn parse_drop(why: &str) -> (String, String, String) {
-    #[cfg(any(test, feature = "diagnostics"))]
     if let Some(row) = split_making(why) {
         return row;
     }
@@ -307,6 +303,7 @@ pub(crate) fn pipeline_method(slot: usize) {
 }
 
 /// The drops of the last second, by reason.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn dropped(drops: &[(String, u64)]) {
     if !on() || drops.is_empty() {
         return;

@@ -59,6 +59,47 @@ use crate::host::host;
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
 
+/// One call of `UpdateTileMappings`, with what it names: one region of
+/// `texture`, from `at`, of `size`, on the ranges of `heap` that `flags`,
+/// `starts` (none: no heap, no offsets) and `counts` say.
+struct Mapping {
+    texture: ID3D12Resource,
+    at: D3D12_TILED_RESOURCE_COORDINATE,
+    size: D3D12_TILE_REGION_SIZE,
+    heap: Option<ID3D12Heap>,
+    flags: Vec<D3D12_TILE_RANGE_FLAGS>,
+    starts: Option<Vec<u32>>,
+    counts: Vec<u32>,
+}
+
+// SAFETY: a texture and a heap (free-threaded objects) and plain numbers,
+// with one owner.
+unsafe impl Send for Mapping {}
+
+/// `mapping` goes to `queue`, in order with the lists that go to it
+/// (`crate::host::in_queue_order`).
+fn map(queue: &ID3D12CommandQueue, mapping: Mapping) {
+    crate::host::in_queue_order(queue, move |queue| {
+        // SAFETY: a live reserved texture and, if one is named, a live heap
+        // of ours; one region; as many ranges as `flags` has, in arrays of
+        // that length that live through the call.
+        unsafe {
+            queue.UpdateTileMappings(
+                &mapping.texture,
+                1,
+                Some(&raw const mapping.at),
+                Some(&raw const mapping.size),
+                mapping.heap.as_ref(),
+                mapping.flags.len() as u32,
+                Some(mapping.flags.as_ptr()),
+                mapping.starts.as_ref().map(|starts| starts.as_ptr()),
+                Some(mapping.counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    });
+}
+
 /// Tiles in one heap of the pool (64 MiB). The largest level given is a
 /// 4096x4096 one of one byte a texel: 256 tiles.
 const HEAP_TILES: u32 = 1024;
@@ -513,25 +554,22 @@ impl Tiled {
                 NumTiles: tiles,
                 ..Default::default()
             };
-            let flag = D3D12_TILE_RANGE_FLAG_NULL;
             let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture; one region of the
-            // subresource's `tiles` tiles, in one range of that many tiles
-            // that names no heap (the null flag: no heap and no offset).
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    None::<&ID3D12Heap>,
-                    1,
-                    Some(&raw const flag),
-                    None,
-                    Some(&raw const tiles),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
-            }
+            // One region of the subresource's `tiles` tiles, in one range of
+            // that many tiles that names no heap (the null flag: no heap and
+            // no offset).
+            map(
+                queue,
+                Mapping {
+                    texture: texture.clone(),
+                    at,
+                    size,
+                    heap: None,
+                    flags: vec![D3D12_TILE_RANGE_FLAG_NULL],
+                    starts: None,
+                    counts: vec![tiles],
+                },
+            );
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             given.levels[level as usize] = false;
@@ -698,6 +736,8 @@ impl Tiled {
         self.give_locked(&mut given, queue, device, texture, named, may, 0)
     }
 
+    // The lock held, the queue and device the mapping goes through, the texture and its three level masks.
+    #[allow(clippy::too_many_arguments)]
     fn give_locked(
         &self,
         given: &mut Given,
@@ -740,29 +780,21 @@ impl Tiled {
                 ..Default::default()
             };
             // One region, the subresource's tiles in order, on as many
-            // ranges of the heap as the runs taken.
-            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; runs.len()];
-            let starts: Vec<u32> = runs.iter().map(|run| run.0).collect();
-            let counts: Vec<u32> = runs.iter().map(|run| run.1).collect();
+            // ranges of the heap as the runs taken (whose counts add up to
+            // `tiles`).
             let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours; one
-            // region of `tiles` tiles from the subresource's first tile;
-            // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
-            }
+            map(
+                queue,
+                Mapping {
+                    texture: texture.clone(),
+                    at,
+                    size,
+                    heap: Some(heap),
+                    flags: vec![D3D12_TILE_RANGE_FLAG_NONE; runs.len()],
+                    starts: Some(runs.iter().map(|run| run.0).collect()),
+                    counts: runs.iter().map(|run| run.1).collect(),
+                },
+            );
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             match level {

@@ -441,27 +441,36 @@ fn big_blocks() -> String {
 
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
+/// With the `mimalloc` feature the blocks come from mimalloc instead.
 struct Counting;
+
+/// Where [`Counting`] gets its blocks.
+#[cfg(not(feature = "mimalloc"))]
+const INNER: std::alloc::System = std::alloc::System;
+#[cfg(feature = "mimalloc")]
+const INNER: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // SAFETY: every call goes to the system's allocator unchanged; only
 // counters are kept beside it.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let at = unsafe { INNER.alloc(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            crate::account::block(at, layout.size(), true);
         }
         at
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let at = unsafe { INNER.alloc_zeroed(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            crate::account::block(at, layout.size(), true);
         }
         at
     }
@@ -469,18 +478,21 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
         own(layout.size(), false);
         big(at, layout.size(), false);
+        crate::account::block(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
-        unsafe { std::alloc::System.dealloc(at, layout) };
+        unsafe { INNER.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = unsafe { INNER.realloc(at, layout, size) };
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);
             big(at, layout.size(), false);
             big(moved, size, true);
+            crate::account::block(at, layout.size(), false);
+            crate::account::block(moved, size, true);
         }
         moved
     }
@@ -809,6 +821,8 @@ fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
+    // The account by owner (`VICTORY_MEMORY_ACCOUNT`), if it is due.
+    crate::account::tick(working);
     let (free, left) = system_memory();
     let copies = crate::shadow::memory();
     let staged = crate::texture::memory();
@@ -910,12 +924,19 @@ fn log_memory() {
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
-         asked for in each",
+         asked for in each; windows made again within 60 s of a let-go at the same key: {} \
+         {:.0} MB; window buffers taken from the spare list (VICTORY_WINDOW_KEEP=1): {}, {} kept \
+         {:.0} MB",
         windows[0],
         mb(windows[1]),
         stagings[0],
         mb(stagings[1]),
         mb(windows[2]),
+        windows[3],
+        mb(windows[4]),
+        windows[5],
+        windows[6],
+        mb(windows[7]),
     );
     tracing::info!(
         "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
@@ -1056,6 +1077,34 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    // With the account by owner (`VICTORY_MEMORY_ACCOUNT`): host lists by
+    // state, and what is kept spare that a switch can let go.
+    if crate::account::on() {
+        let idle = crate::list::idle_lists();
+        let send = crate::host::send_spare();
+        let trimmed = crate::mapped_trim::done();
+        tracing::info!(
+            "memory account, host lists by state: {} alive, {} of them idle in the pool (run, reset, waiting to be \
+             taken again), {} never reset since they were made, {} the title's own or in flight; the fewest idle \
+             since the last trim (VICTORY_LIST_IDLE_TRIM_S lets those go): {}; kept spare: {} send buffers {:.0} MB \
+             (at most {:.0} MB, VICTORY_SEND_SPARE_MB), {} scratch chunks {:.0} MB (VICTORY_SCRATCH_SPARE_MB), \
+             staging blocks {} MB (VICTORY_STAGING_REST_MS); mapped files let go from memory \
+             (VICTORY_MAPPED_TRIM): {} passes, views of {} MB in the last",
+            alive[0],
+            idle[0],
+            lists[3],
+            alive[0].saturating_sub(idle[0]),
+            idle[1],
+            send[0],
+            mb(send[1]),
+            mb(send[2]),
+            alive[3],
+            mb(alive[4]),
+            pool[1],
+            trimmed[0],
+            trimmed[1],
+        );
+    }
     if memory_categories() {
         let fields: &[(&str, u64)] = &[
             ("working set", working),

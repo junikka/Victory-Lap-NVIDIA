@@ -471,7 +471,8 @@ fn this_process(process: *mut c_void) -> bool {
 #[cfg(windows)]
 fn place_new(process: *mut c_void, thread: *mut c_void) {
     if this_process(process) {
-        victory_gpu::place_title_handle(thread);
+        // SAFETY: the handle the host just returned for a thread of this process.
+        unsafe { victory_gpu::place_title_handle(thread) };
     }
 }
 
@@ -486,8 +487,9 @@ pub extern "system" fn CreateThread(
     id: *mut u32,
 ) -> *mut c_void {
     let thread = host::create_thread(attributes, stack, start, param, flags, id);
+    // SAFETY: the handle `CreateThread` just returned, or null.
     #[cfg(windows)]
-    victory_gpu::place_title_handle(thread);
+    unsafe { victory_gpu::place_title_handle(thread) };
     thread
 }
 
