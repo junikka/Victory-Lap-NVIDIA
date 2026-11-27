@@ -1,6 +1,6 @@
 # VIctory on an RTX 3080 (NVIDIA)
 
-**Current state (26 Nov 2026, play13):** 13 fps on average in the open world, up from 3-4 fps, on an RTX 3080 10 GB, 32 GB RAM and i9-12900F at 1080p. That is 10.9-11.6 ms per 1,000 draws, down from 36-42. Playable, not smooth yet; the goal is a stable 30 fps.
+**Current state (27 Nov 2026, play31):** on an RTX 3080 10 GB, i9-12900F and 32 GB RAM at 1080p (Series S profile), our camera-spin test route now runs at 17.6-19.1 fps (52-57 ms a frame), up from about 13 fps, mostly because a debug log in our BVH-builder stand-in fired about 110 times a frame and now logs once. With no draws the title already runs at its own 30 fps cap, so what remains is our draw path, submitting thread and card time, all measured in [docs/fps-findings-rtx3080.md](docs/fps-findings-rtx3080.md) with what we tried and did not keep. This build also adds an in-game settings menu (F6) and a compact HUD (F3), and every test suite now passes with the play settings.
 
 - **What this is:** the open-source VIctory layer (GPL-3.0), on the cool_fox fork, with about 200 commits on top: ported fixes from about a dozen public forks plus our own NVIDIA memory and residency work and measurement tooling.
 - **The approach, the numbers and what limits it now:** [WRITEUP.md](WRITEUP.md).
