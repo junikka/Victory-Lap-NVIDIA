@@ -1,0 +1,10 @@
+[package]
+name = "xbox-bvh-builder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Windows stand-in for XboxBvhBuilder.dll with conservative DXR prebuild sizes"
+
+[lib]
+name = "XboxBvhBuilder"
+crate-type = ["cdylib"]

@@ -3,6 +3,13 @@
 param([string]$Exe = "$PSScriptRoot\..\target\release\victory.exe")
 if (-not $env:VICTORY_GAME_DIR) { throw 'Set VICTORY_GAME_DIR to the folder with your own copy of the title.' }
 $env:XCL_NETWORK = '0'
+# The title imports XboxBvhBuilder.dll, which a PC copy does not have. crates/xbox-bvh-builder is our Windows
+# stand-in (conservative ray-tracing prebuild sizes). Build it (cargo build --release -p xbox-bvh-builder)
+# and put target\release\XboxBvhBuilder.dll beside the title's executable yourself; this script does not
+# copy anything into your game folder. VICTORY_BVH_LOG_ONCE=1 below keeps its log to one line per entry point.
+if (-not (Test-Path (Join-Path $env:VICTORY_GAME_DIR 'XboxBvhBuilder.dll'))) {
+    Write-Warning 'XboxBvhBuilder.dll is not in VICTORY_GAME_DIR: build crates/xbox-bvh-builder and copy it there.'
+}
 $set = @(
     # Play tuning
     'VICTORY_PIPELINE_WAIT_MS=24', 'VICTORY_LATE_WAIT=3', 'VICTORY_WIDE_BACK=1',

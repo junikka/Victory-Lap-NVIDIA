@@ -7,4 +7,5 @@ Exported with `git archive` from commit f321192d, without history.
 - Licence: GPL-3.0 (see LICENSE); keep it when sharing.
 - Some upstream source files and docs name the title; they came from upstream as-is.
 - Build: `cargo build --release -p victory --features diagnostics` (Rust 1.98.1, MSVC).
-- Play-tuned switches: see the launchers in the victory-lap repo (not included here).
+- Play-tuned switches: scripts/play-nvidia.ps1 (the measured play30 set).
+- crates/xbox-bvh-builder: our Windows stand-in for the title's XboxBvhBuilder.dll (no title code); build it and place the DLL beside the title's executable yourself.
