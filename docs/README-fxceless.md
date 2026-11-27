@@ -201,7 +201,6 @@ loads the world and shows it: slowly, and with rendering defects.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
 
 > **Warning.** Entering the world on a real GPU has hung it in earlier
 > builds, and Windows then resets the display driver (every monitor goes
