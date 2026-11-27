@@ -677,7 +677,7 @@ fn wide_null(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-include!("../../pe_import_table.rs");
+include!("../pe_import_table.rs");
 
 #[test]
 fn release_dll_imports_only_kernel32_ntdll_or_api_sets() {
