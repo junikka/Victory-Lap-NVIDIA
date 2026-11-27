@@ -20,7 +20,7 @@ Spin steady (world + 150 s, 5 s windows): 16.5-19.1 fps, 52-60 ms a frame at 5,1
 - 182 PROMISING: constants copied to card memory (card -10 to -11 ms, frame held).
 - 183 REJECTED: 14 thin threads (free RAM low -2.3 GB, 1.8 s stall).
 - 176 NOT promising: page sections (the gain was the constants copy).
-- VICTORY_VIEW_SRGB: 0 views needing the sRGB twin along spin.
+- sRGB-twin count (a ticket build's counter, not in this source): 0 views needing the sRGB twin along spin.
 - Heap pass line: ~6-7 ms looking at slots, ~3 copies' spans, ~5-6 textures a frame.
 
 ## Wanted from other forks

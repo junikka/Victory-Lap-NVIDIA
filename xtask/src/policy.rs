@@ -18,6 +18,8 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
     // Scripts as the two before it: tools/profile reads a run's profile.
     "py",
+    // Linker module-definition text (crates/xbox-bvh-builder: the stand-in DLL's exports).
+    "def",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
