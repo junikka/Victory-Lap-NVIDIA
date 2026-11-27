@@ -123,6 +123,7 @@ mod readkinds;
 mod shadow;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod shot;
+mod settings_menu;
 #[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
@@ -163,6 +164,7 @@ pub use census::title_memory_reserved;
 pub use waitwhy::note_disk_window;
 #[cfg(windows)]
 pub use host::on_failure;
+pub use settings_menu::{SETTINGS_MENU_OPEN, menu_on as settings_menu_on};
 
 /// Whether the memory account is kept (`VICTORY_MEMORY_ACCOUNT`,
 /// diagnostics builds): the runtime then answers the title's plain

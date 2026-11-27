@@ -5089,7 +5089,11 @@ mod tests {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
-            title_memory_remapped(view, bytes);
+            // As the runtime does (xmem) and lazy_back's tests do: the guard is told the view is going
+            // before it goes, so its VIEWS bit is cleared and a later allocation at the same address is
+            // not refused as a view (ticket 173: the play set's watch:: failures with VICTORY_PORT_GUARD=1).
+            let _changing = title_memory_remapping();
+            title_memory_unmapping(view, bytes);
             // SAFETY: a view of the section mapped by `two_views`.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

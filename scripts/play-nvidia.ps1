@@ -1,4 +1,4 @@
-# play-nvidia.ps1: run VIctory with the switch set measured on an RTX 3080 10 GB / 32 GB RAM (WRITEUP.md; build play30).
+# play-nvidia.ps1: run VIctory with the switch set measured on an RTX 3080 10 GB / 32 GB RAM (WRITEUP.md; build play31).
 # Set VICTORY_GAME_DIR to your own copy of the title first. No game files are included.
 param([string]$Exe = "$PSScriptRoot\..\target\release\victory.exe")
 if (-not $env:VICTORY_GAME_DIR) { throw 'Set VICTORY_GAME_DIR to the folder with your own copy of the title.' }
@@ -30,6 +30,9 @@ $set = @(
     'VICTORY_WINDOWS_BAR_MB=2048',
     # play30: the BVH stand-in DLL logs its prebuild call once instead of ~110 times a frame (-21 to -24 ms)
     'VICTORY_BVH_LOG_ONCE=1',
+    # play31: F6 opens a settings menu (arrows pick and change; * rows apply at the next launch), F3 cycles the HUD Off / Minimal / Full.
+    # Changes are saved to VICTORY_SETTINGS_FILE (default C:\victory-data\settings.txt); delete the file to go back to this list.
+    'VICTORY_SETTINGS_MENU=1',
     # On-screen performance panel (top left); remove to hide it
     'VICTORY_PANEL=1'
 )

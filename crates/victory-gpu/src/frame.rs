@@ -33,7 +33,7 @@ const SIXTIETH: Duration = Duration::from_micros(16_667);
 
 /// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
 /// title's (zero: no wait). Read once.
-fn asked() -> Option<Duration> {
+pub(crate) fn asked() -> Option<Duration> {
     static ASKED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *ASKED.get_or_init(|| {
         let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;

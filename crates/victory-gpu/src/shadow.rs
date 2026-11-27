@@ -731,7 +731,7 @@ fn window_card_for(key: (u64, u64), size: u64) -> Option<ID3D12Resource> {
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
 /// [`window_room_for`], which this comes before.
-fn window_mapped_most() -> u64 {
+pub(crate) fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20

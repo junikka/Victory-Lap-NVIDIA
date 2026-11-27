@@ -2483,6 +2483,18 @@ fn texture_max() -> Option<u64> {
     }
 }
 
+/// The cap the run started with, for the settings menu: 0 for none, the
+/// pixels, `None` for the cap that follows the card's memory.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn texture_max_pixels() -> Option<u64> {
+    match texture_max_set() {
+        TextureMax::Off => Some(0),
+        TextureMax::Pixels(n) => Some(n),
+        TextureMax::Auto => None,
+    }
+}
+
 /// `VICTORY_TEXTURE_MAX` ([`texture_max`]), read once.
 #[cfg(windows)]
 fn texture_max_set() -> TextureMax {

@@ -7,9 +7,13 @@
 //! box out of a buffer in the card's memory. Copied onto the swap chain's
 //! buffer, behind the title's picture: saved frames and the frame recorder
 //! see the title's own.
+//!
+//! With the settings menu (`crate::settings_menu`, `VICTORY_SETTINGS_MENU=1`)
+//! F3 cycles Off, Minimal (one line, made again once a second; nothing is
+//! counted or drawn while Off) and Full (this panel), and F6 opens the menu.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -18,13 +22,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::{Host, HostList, transition};
+use crate::settings_menu::{self as menu, CELL, Dots, GLYPH, Hud, Key, Layout, Menu, ROWS, Start, glyph};
 
 /// How often the numbers change.
 const EVERY: Duration = Duration::from_millis(500);
 
-/// A character's dots, and with the space beside and below it.
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
 const LINES: u32 = 9;
@@ -57,54 +59,6 @@ fn pressed() -> bool {
     // SAFETY: plain queries; room for the answer.
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
     process == std::process::id()
-}
-
-/// Seven rows of five dots, the leftmost the highest bit.
-#[rustfmt::skip]
-const fn glyph(c: u8) -> [u8; 7] {
-    match c {
-        b'0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        b'1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        b'2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
-        b'3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        b'4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        b'5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-        b'6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        b'7' => [0b11111, 0b00001, 0b00010, 0b00010, 0b00100, 0b00100, 0b00100],
-        b'8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        b'9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
-        b'A' => [0b00100, 0b01010, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001],
-        b'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        b'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
-        b'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-        b'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        b'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        b'G' => [0b01111, 0b10000, 0b10000, 0b10011, 0b10001, 0b10001, 0b01111],
-        b'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        b'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        b'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
-        b'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-        b'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        b'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        b'N' => [0b10001, 0b11001, 0b11001, 0b10101, 0b10011, 0b10011, 0b10001],
-        b'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        b'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        b'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-        b'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        b'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        b'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        b'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        b'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        b'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
-        b'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        b'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-        b'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        b'.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
-        b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
-        b'-' => [0, 0, 0, 0b11111, 0, 0, 0],
-        b' ' => [0; 7],
-        _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
-    }
 }
 
 /// The box's size in pixels, a dot being `scale` of them each way.
@@ -230,6 +184,8 @@ struct Buffers {
     format: DXGI_FORMAT,
     scale: u32,
     pitch: u32,
+    /// The box's size in pixels.
+    size: (u32, u32),
     uploads: Vec<(ID3D12Resource, *mut u8)>,
     card: ID3D12Resource,
     /// The upload written last.
@@ -243,7 +199,11 @@ unsafe impl Send for Buffers {}
 
 impl Buffers {
     fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
+        Buffers::sized(host, format, scale, size(scale))
+    }
+
+    /// For a box of that many pixels.
+    fn sized(host: &Host, format: DXGI_FORMAT, scale: u32, (width, height): (u32, u32)) -> Option<Buffers> {
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -268,17 +228,131 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
+        Some(Buffers { format, scale, pitch, size: (width, height), uploads, card: card?, turn: 0, fresh: false })
     }
 
     fn write(&mut self, lines: &[String]) {
         let Some(colours) = colours(self.format) else { return };
         let picture = painted(lines, self.scale, colours, self.pitch as usize);
+        self.put(&picture);
+    }
+
+    /// A picture of rows of the pitch, the box's height.
+    fn put(&mut self, picture: &[u8]) {
+        debug_assert_eq!(picture.len(), self.pitch as usize * self.size.1 as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
         self.fresh = true;
     }
+
+    /// Records the copy of the box onto `back` at `(x, y)`, a buffer of the
+    /// swap chain of that size and format in the state to be copied into.
+    fn copy_onto(&mut self, list: &HostList, back: &ID3D12Resource, (x, y): (u32, u32), (width, height): (u32, u32)) {
+        if x >= width || y >= height {
+            return;
+        }
+        let (w, h) = self.size;
+        let list = &list.list;
+        // SAFETY: an open list and live resources; the box lies within both.
+        unsafe {
+            if std::mem::take(&mut self.fresh) {
+                list.CopyResource(&self.card, &self.uploads[self.turn].0);
+                list.ResourceBarrier(&[transition(
+                    &self.card,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&self.card),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: self.format,
+                            Width: w,
+                            Height: h,
+                            Depth: 1,
+                            RowPitch: self.pitch,
+                        },
+                    },
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(back),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let part = D3D12_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: w.min(width - x),
+                bottom: h.min(height - y),
+                back: 1,
+            };
+            list.CopyTextureRegion(&to, x, y, 0, &from, Some(&part));
+        }
+    }
+}
+
+/// A box of the menu's: its buffers, made for the picture's format and
+/// scale, and whether its picture is to be made again.
+#[derive(Default)]
+struct Shown {
+    buffers: Option<Buffers>,
+    failed: bool,
+    dirty: bool,
+}
+
+impl Shown {
+    /// Records the copy of the picture `paint` makes (`dots` dots, each
+    /// `scale` pixels) onto `back` at `at`; `paint` runs only when the
+    /// picture changed or the buffers are new.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &mut self,
+        host: &Host,
+        list: &HostList,
+        back: &ID3D12Resource,
+        at: (u32, u32),
+        screen: (u32, u32),
+        format: DXGI_FORMAT,
+        scale: u32,
+        dots: (u32, u32),
+        paint: impl FnOnce() -> Dots,
+    ) {
+        let Some(layout) = layout(format) else { return };
+        if self.failed {
+            return;
+        }
+        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+            // (What the card may still read stays, as for the panel's own.)
+            std::mem::forget(self.buffers.take());
+            self.buffers = Buffers::sized(host, format, scale, (dots.0 * scale, dots.1 * scale));
+            self.failed = self.buffers.is_none();
+            self.dirty = true;
+        }
+        let Some(buffers) = &mut self.buffers else { return };
+        if std::mem::take(&mut self.dirty) {
+            let picture = paint().scaled(scale, &menu::pixels(layout), buffers.pitch as usize);
+            buffers.put(&picture);
+        }
+        buffers.copy_onto(list, back, at, screen);
+    }
+}
+
+/// How a swap chain's format lays out a pixel.
+fn layout(format: DXGI_FORMAT) -> Option<Layout> {
+    Some(match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM => Layout::Rgba8,
+        DXGI_FORMAT_B8G8R8A8_UNORM => Layout::Bgra8,
+        DXGI_FORMAT_R10G10B10A2_UNORM => Layout::Rgb10a2,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => Layout::Rgba16f,
+        _ => return None,
+    })
 }
 
 /// The panel of a presenter.
@@ -294,6 +368,157 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    /// The settings menu's boxes, with the menu on.
+    ui: Option<Ui>,
+}
+
+/// The settings menu's state; one for the process, as a presenter made
+/// again (a new swap chain) starts a new [`Panel`].
+struct State {
+    menu: Menu,
+    edges: menu::Edges,
+    hud: Hud,
+    path: std::path::PathBuf,
+    /// The output size was taken from the first picture shown.
+    output_seen: bool,
+}
+
+fn state() -> &'static Mutex<State> {
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let path = menu::file_path();
+        let file = std::fs::read_to_string(&path).map(|t| menu::parse(&t)).unwrap_or_default();
+        let menu = Menu::new(starts(), &file);
+        let hud = Hud::of(menu.value[menu::PANEL]);
+        let live: Vec<&str> = (0..menu::COUNT).filter(|&i| menu.live[i]).map(|i| ROWS[i].key).collect();
+        tracing::info!(
+            file = %path.display(),
+            lines = file.len(),
+            ?live,
+            "settings menu on (VICTORY_SETTINGS_MENU=1): F6 opens it, F3 cycles the panel; the other rows are for the next launch"
+        );
+        Mutex::new(State { menu, edges: menu::Edges::default(), hud, path, output_seen: false })
+    })
+}
+
+/// What each row runs with, from the values the layer read at its start.
+fn starts() -> [Start; menu::COUNT] {
+    let other = |s: String| Start::Other(s.to_ascii_uppercase());
+    let frame_cap = match crate::frame::asked() {
+        // The title's own rate, 30.
+        None => Start::Value(0),
+        Some(d) if d.is_zero() => Start::Value(2),
+        Some(d) if (d.as_secs_f64() * 1e3 - 16.667).abs() < 0.05 => Start::Value(1),
+        Some(d) => other(format!("{:.0}", 1.0 / d.as_secs_f64())),
+    };
+    let texture_detail = match crate::resource::drop_mips() {
+        1 => Start::Value(0),
+        0 => Start::Value(1),
+        n => other(format!("DROP {n}")),
+    };
+    let texture_cap = match crate::resource::texture_max_pixels() {
+        Some(0) => Start::Value(0),
+        Some(n) => match menu::number_value(menu::TEXTURE_CAP, n as f64) {
+            Start::Other(_) => other(n.to_string()),
+            known => known,
+        },
+        None => other("auto".into()),
+    };
+    let windows = match crate::shadow::window_mapped_most() >> 20 {
+        0 => Start::Value(2),
+        mb => match menu::number_value(menu::MEMORY_WINDOWS, mb as f64) {
+            Start::Other(_) => other(format!("{mb} MB")),
+            known => known,
+        },
+    };
+    let ambient = match crate::ambient::start_level() {
+        Some(level) => menu::number_value(menu::AMBIENT, f64::from(level)),
+        None => other("off".into()),
+    };
+    let reflections = match crate::ambient::reflect_start() {
+        p if p <= 0.0 => Start::Value(0),
+        p => menu::number_value(menu::REFLECTIONS, f64::from(p)),
+    };
+    let panel = match (asked(), crate::switch::on("VICTORY_PANEL_MINIMAL")) {
+        (false, _) => Start::Value(0),
+        (true, true) => Start::Value(1),
+        (true, false) => Start::Value(2),
+    };
+    [
+        frame_cap,
+        // Taken from the first picture shown.
+        other("?".into()),
+        texture_detail,
+        texture_cap,
+        windows,
+        ambient,
+        Start::Value(if crate::ambient::sky_on() { 0 } else { 1 }),
+        reflections,
+        panel,
+    ]
+}
+
+/// The output size as the menu shows it.
+fn output_start((width, height): (u32, u32)) -> Start {
+    let named = format!("{width}x{height}");
+    match menu::file_value(menu::OUTPUT, &named) {
+        Some(v) => Start::Value(v),
+        None => Start::Other(named.to_ascii_uppercase()),
+    }
+}
+
+/// Our window is in front.
+fn ours_in_front() -> bool {
+    let mut process = 0;
+    // SAFETY: plain queries; room for the answer.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
+    process == std::process::id()
+}
+
+/// The menu's keys pressed since the last look, one bit per [`Key::ALL`],
+/// with one of our windows in front.
+fn menu_presses(edges: &mut menu::Edges) -> u8 {
+    let (mut down, mut tapped) = (0u8, 0u8);
+    for (i, key) in Key::ALL.iter().enumerate() {
+        // SAFETY: a plain query.
+        let state = unsafe { GetAsyncKeyState(i32::from(key.vk())) };
+        down |= u8::from(state < 0) << i;
+        tapped |= u8::from(state & 1 != 0) << i;
+    }
+    let pressed = edges.pressed(down, tapped);
+    if pressed != 0 && !ours_in_front() { 0 } else { pressed }
+}
+
+/// The boxes of the menu and of the minimal panel, and the minimal panel's
+/// counting.
+struct Ui {
+    menu: Shown,
+    minimal: Shown,
+    since: Instant,
+    frames: u32,
+    line: String,
+    /// The menu's picture, made when it changed.
+    picture: Option<Dots>,
+}
+
+impl Ui {
+    fn new() -> Ui {
+        Ui {
+            menu: Shown::default(),
+            minimal: Shown::default(),
+            since: Instant::now(),
+            frames: 0,
+            line: String::new(),
+            picture: None,
+        }
+    }
+}
+
+/// Where the menu goes on a picture of that size, its box being `w` pixels
+/// wide: right of the middle, a quarter of the way down, as drawn in the
+/// approved picture (194 of 1280 from the right, 169 of 720 from the top).
+fn menu_at((width, height): (u32, u32), w: u32) -> (u32, u32) {
+    (width.saturating_sub(w + width * 194 / 1280), height * 169 / 720)
 }
 
 impl Panel {
@@ -310,13 +535,17 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            ui: None,
         }
     }
 
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
     pub(super) fn frame(&mut self, line: bool) {
-        if pressed() {
+        if menu::menu_on() {
+            // The menu's keys and the minimal panel; Full is this one.
+            self.menu_frame();
+        } else if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
         if !shown().load(Ordering::Relaxed) {
@@ -358,6 +587,9 @@ impl Panel {
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
     ) {
+        if menu::menu_on() {
+            self.menu_draw(host, list, back, (width, height), format);
+        }
         if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
             return;
         }
@@ -376,50 +608,127 @@ impl Panel {
         if std::mem::take(&mut self.changed) {
             buffers.write(&self.lines);
         }
-        let (w, h) = size(scale);
-        let list = &list.list;
-        // SAFETY: an open list and live resources; the box lies within both.
-        unsafe {
-            if std::mem::take(&mut buffers.fresh) {
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(
-                    &buffers.card,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-            }
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&buffers.card),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: format,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: buffers.pitch,
-                        },
-                    },
-                },
-            };
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let part = D3D12_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w.min(width),
-                bottom: h.min(height),
-                back: 1,
-            };
-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
-        }
+        buffers.copy_onto(list, back, (0, 0), (width, height));
         self.cost += began.elapsed();
+    }
+
+    /// The settings menu's part of a frame presented: its keys, what they
+    /// change, and the minimal panel's count (once a second; nothing while
+    /// the panel is not Minimal).
+    fn menu_frame(&mut self) {
+        let ui = self.ui.get_or_insert_with(Ui::new);
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        let pressed = menu_presses(&mut state.edges);
+        for (i, key) in Key::ALL.iter().enumerate() {
+            if pressed & (1 << i) == 0 {
+                continue;
+            }
+            let outcome = state.menu.press(*key);
+            if outcome.redraw {
+                ui.picture = None;
+            }
+            if *key == Key::F6 {
+                menu::SETTINGS_MENU_OPEN.store(state.menu.open, Ordering::Relaxed);
+            }
+            if let Some(row) = outcome.changed {
+                changed(&mut state, row);
+                ui.picture = None;
+            }
+        }
+        let hud = state.hud;
+        drop(state);
+        // The full panel is this one's, shown as without the menu.
+        shown().store(hud == Hud::Full, Ordering::Relaxed);
+        if hud != Hud::Minimal {
+            ui.frames = 0;
+            return;
+        }
+        let now = Instant::now();
+        if ui.frames == 0 {
+            ui.since = now;
+        }
+        ui.frames += 1;
+        let elapsed = now - ui.since;
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let Some(host) = super::host() else { return };
+        // The frames since the last line, so its first frame is not counted twice.
+        let frames = f64::from(ui.frames - 1);
+        let ms = elapsed.as_secs_f64() * 1e3 / frames.max(1.0);
+        let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        let (_, private) = crate::copystat::process_memory();
+        let [budget, used, ..] = host.video_memory().unwrap_or_default();
+        ui.line = menu::minimal_text(1e3 / ms.max(0.001), ms, gb(private), gb(used), gb(budget));
+        ui.minimal.dirty = true;
+        (ui.since, ui.frames) = (now, 1);
+    }
+
+    /// Records the minimal panel and the menu onto `back`, as [`Panel::draw`].
+    fn menu_draw(
+        &mut self,
+        host: &Host,
+        list: &HostList,
+        back: &ID3D12Resource,
+        screen: (u32, u32),
+        format: DXGI_FORMAT,
+    ) {
+        let ui = self.ui.get_or_insert_with(Ui::new);
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        if !state.output_seen {
+            state.output_seen = true;
+            state.menu.learnt(menu::OUTPUT, output_start(screen));
+            ui.picture = None;
+        }
+        let (hud, open) = (state.hud, state.menu.open);
+        if open && ui.picture.is_none() {
+            ui.picture = Some(menu::menu_picture(&state.menu));
+            ui.menu.dirty = true;
+        }
+        drop(state);
+        if (hud != Hud::Minimal || ui.line.is_empty()) && !open {
+            return;
+        }
+        // Not the title's: the frame recorder leaves it out.
+        let _ours = crate::replay::record::unrecorded();
+        let scale = scale(screen.1);
+        if hud == Hud::Minimal && !ui.line.is_empty() {
+            let line = &ui.line;
+            let at = (5 * scale, 5 * scale);
+            let dots = menu::minimal_size();
+            ui.minimal.draw(host, list, back, at, screen, format, scale, dots, || menu::minimal_picture(line));
+        }
+        if open && let Some(picture) = &ui.picture {
+            let dots = menu::menu_size();
+            let at = menu_at(screen, dots.0 * scale);
+            ui.menu.draw(host, list, back, at, screen, format, scale, dots, || picture.clone());
+        }
+    }
+}
+
+/// A row changed: a live one acts now; every change goes into the file.
+fn changed(state: &mut State, row: usize) {
+    let value = state.menu.value[row].map(|v| ROWS[row].values[v]);
+    let live = state.menu.live[row];
+    if live && let Some(value) = value {
+        match row {
+            menu::AMBIENT => crate::ambient::set_live_level(value.parse().unwrap_or(0.0)),
+            menu::REFLECTIONS => crate::ambient::set_live_reflect(value.parse().unwrap_or(0.0)),
+            menu::PANEL => state.hud = Hud::of(state.menu.value[row]),
+            _ => {}
+        }
+    }
+    let written = menu::write_file(&state.path, &state.menu.file_text());
+    match written {
+        Ok(()) => tracing::info!(
+            row = ROWS[row].key,
+            value = value.unwrap_or("?"),
+            live,
+            file = %state.path.display(),
+            "settings menu: a setting changed ({})",
+            if live { "now" } else { "at the next launch" }
+        ),
+        Err(error) => tracing::warn!(%error, file = %state.path.display(), "settings menu: the settings file was not written"),
     }
 }
 
@@ -427,18 +736,19 @@ impl Panel {
 mod tests {
     use super::*;
 
-    /// Every character the lines use has its own picture, and no two look
-    /// alike.
     #[test]
-    fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
-        for (i, a) in used.iter().enumerate() {
-            assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
-            assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));
-            for b in &used[i + 1..] {
-                assert_ne!(glyph(*a), glyph(*b), "{} {}", *a as char, *b as char);
-            }
-        }
+    fn the_menu_sits_right_of_the_middle_within_the_picture() {
+        let w = menu::menu_size().0 * 2;
+        let (x, y) = menu_at((1920, 1080), w);
+        assert_eq!((x, y), (1920 - w - 291, 253));
+        assert!(x + w <= 1920 && y + menu::menu_size().1 * 2 <= 1080);
+        // A picture narrower than the box: at the left edge.
+        assert_eq!(menu_at((400, 300), w).0, 0);
+        assert_eq!(output_start((1920, 1080)), Start::Value(0));
+        assert_eq!(output_start((2560, 1440)), Start::Other("2560X1440".into()));
+        assert_eq!(layout(DXGI_FORMAT_B8G8R8A8_UNORM), Some(Layout::Bgra8));
+        assert_eq!(layout(DXGI_FORMAT_R16G16B16A16_FLOAT), Some(Layout::Rgba16f));
+        assert_eq!(layout(DXGI_FORMAT_R32G32B32A32_FLOAT), None);
     }
 
     #[test]

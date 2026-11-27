@@ -95,7 +95,7 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
-    } else if reflect_part() > 0.0 && has(REFLECTED) {
+    } else if reflect_start() > 0.0 && has(REFLECTED) {
         Some(Role::Reflect)
     } else {
         None
@@ -131,6 +131,16 @@ pub(crate) fn sky_on() -> bool {
 /// The part a reflection may hold of the light around
 /// (`VICTORY_AMBIENT_REFLECT=<part>`). 0 unless it is a finite number above 0.
 fn reflect_part() -> f32 {
+    if let Some(part) = live(&LIVE_REFLECT) {
+        return part;
+    }
+    reflect_start()
+}
+
+/// The part the run started with: programs are marked to be held by it when
+/// they are made ([`role`]), so a live change ([`set_live_reflect`]) acts
+/// only on a run that started with a part.
+pub(crate) fn reflect_start() -> f32 {
     #[cfg(test)]
     if let Some(part) = FORCE_REFLECT.with(|c| c.get()) {
         return part;
@@ -144,6 +154,46 @@ fn parse_reflect(value: Option<&str>) -> f32 {
         .and_then(|v| v.trim().parse().ok())
         .filter(|v: &f32| v.is_finite() && *v > 0.0)
         .unwrap_or(0.0)
+}
+
+/// Values the settings menu changed while the title runs
+/// (`crate::settings_menu`, ticket 174): an f32's bits, `u32::MAX` while
+/// none is set, which is always without the menu. Both are root constants
+/// of every dispatch, so the next frame has them.
+static LIVE_LEVEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static LIVE_REFLECT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+fn live(value: &std::sync::atomic::AtomicU32) -> Option<f32> {
+    let bits = value.load(std::sync::atomic::Ordering::Relaxed);
+    (bits != u32::MAX).then(|| f32::from_bits(bits))
+}
+
+/// The estimate's level from now on, if the run started with an estimate
+/// ([`start_level`]); otherwise nothing changes.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn set_live_level(level: f32) {
+    if start_level().is_some() && level.is_finite() && level > 0.0 {
+        LIVE_LEVEL.store(level.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The reflections' part from now on (0: not held), if the run started with
+/// a part ([`reflect_start`]); otherwise nothing changes.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn set_live_reflect(part: f32) {
+    if reflect_start() > 0.0 && part.is_finite() {
+        LIVE_REFLECT.store(part.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The estimate's level the run started with; `None` when the stand-in is
+/// off or a constant.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn start_level() -> Option<f32> {
+    match start_set() {
+        Set::Estimate(level) => Some(level),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +227,14 @@ fn parse(set: &str) -> Set {
 }
 
 fn set() -> Set {
+    if let Some(level) = live(&LIVE_LEVEL) {
+        return Set::Estimate(level);
+    }
+    start_set()
+}
+
+/// What the run started with.
+fn start_set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }

@@ -175,6 +175,25 @@ pub(crate) fn mouse_held() -> bool {
 }
 static MOUSE_HELD: AtomicBool = AtomicBool::new(false);
 
+/// The settings menu's keys (`victory_gpu::settings_menu_on`, ticket 174):
+/// F3 and F6 are the menu's and never reach the title while it is on.
+const MENU_KEYS: [u8; 2] = [0x72, 0x75];
+
+/// Whether a key held on the host goes to the title: not while the menu is
+/// open, and never the menu's own keys while the menu is on.
+fn key_to_title(vk: u8, menu_on: bool, menu_open: bool) -> bool {
+    !menu_open && !(menu_on && MENU_KEYS.contains(&vk))
+}
+
+/// The mouse as the title gets it: while the settings menu is open no
+/// motion and no buttons, the layout kept (after trustno1-coder's 86a397600,
+/// "suppress mouse motion and buttons while the F1 settings menu is open":
+/// the pointer is still read, so it stays held where it was and closing the
+/// menu makes no jump).
+fn pointer_to_title(pointer: Pointer, menu_open: bool) -> Pointer {
+    if menu_open { Pointer { on: pointer.on, drive: pointer.drive, ..Default::default() } } else { pointer }
+}
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1760,17 +1779,28 @@ mod host {
                 Some(replay) => self.mouse.replayed(&replay.keys()),
                 None => self.mouse.poll(),
             };
+            let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(Ordering::Relaxed);
+            if menu_open {
+                // Travel while it is open is not kept for later.
+                self.mouse.look = Look::default();
+            }
+            self.pointer = pointer_to_title(self.pointer, menu_open);
             self.pointer
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
             let replaying = taps(&mut self.taps).1.is_some();
             let mut down = if replaying { Vec::new() } else { scripted() };
-            let held: Vec<u8> = if focused() {
+            let menu_on = victory_gpu::settings_menu_on();
+            // While the settings menu is open the keys are not even asked
+            // for: what was tapped since the menu last looked stays for it.
+            let menu_open = menu_on && victory_gpu::SETTINGS_MENU_OPEN.load(Ordering::Relaxed);
+            let held: Vec<u8> = if focused() && !menu_open {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    .filter(|&vk| key_to_title(vk, menu_on, menu_open))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect()
@@ -2373,6 +2403,20 @@ mod tests {
         );
         let pad = fallback(&[key(b'S')], drive);
         assert_eq!(pad, PadState { left_trigger: 1.0, ..Default::default() });
+    }
+
+    #[test]
+    fn the_settings_menu_keeps_keys_and_the_mouse_off_the_title() {
+        // Menu off: every key, F3 and F6 too, as before.
+        assert!(key_to_title(0x72, false, false) && key_to_title(0x75, false, false) && key_to_title(0x26, false, false));
+        // Menu on, closed: all but its own keys.
+        assert!(!key_to_title(0x72, true, false) && !key_to_title(0x75, true, false));
+        assert!(key_to_title(0x26, true, false) && key_to_title(0x0D, true, false));
+        // Open: none.
+        assert!(!key_to_title(0x26, true, true) && !key_to_title(0x41, true, true));
+        let pointer = Pointer { on: true, right_x: 0.4, right_y: -0.2, fire: true, aim: true, drive: true };
+        assert_eq!(pointer_to_title(pointer, false), pointer);
+        assert_eq!(pointer_to_title(pointer, true), Pointer { on: true, drive: true, ..Default::default() });
     }
 
     #[test]
