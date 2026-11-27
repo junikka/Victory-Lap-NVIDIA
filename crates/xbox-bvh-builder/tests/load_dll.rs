@@ -392,6 +392,9 @@ fn build_release_dll_once() -> PathBuf {
         .arg(workspace.join("Cargo.toml"))
         .arg("--target-dir")
         .arg(&target)
+        // The stand-in may import only KERNEL32, ntdll and api-ms-win-core-*: link the C runtime
+        // statically for this crate alone (the workspace's own build keeps the dynamic one).
+        .env("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS", "-C target-feature=+crt-static")
         .output()
         .expect("spawn cargo build");
     assert!(
